@@ -1,0 +1,15 @@
+#include <ap_int.h>
+#include <hls_stream.h>
+#include <cstdint>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+#include "../include/par1_bfv_hls_constants.hpp"
+extern "C" void par1_kklss_bfv_kernel(ap_uint<64>*,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,unsigned int,uint64_t,hls::stream<ap_uint<6>>&);
+namespace{using word=ap_uint<64>;using addr_t=uint64_t;using namespace par1_bfv_hls;
+addr_t al(addr_t x){return(x+4095)&~addr_t(4095);}std::vector<uint64_t>ld(const std::string&p){std::ifstream f(p,std::ios::binary|std::ios::ate);if(!f)throw std::runtime_error("open "+p);size_t n=f.tellg();f.seekg(0);std::vector<uint64_t>v(n/8);f.read((char*)v.data(),n);return v;}void put(std::vector<word>&h,addr_t a,const std::vector<uint64_t>&v){for(size_t i=0;i<v.size();++i)h[a+i]=v[i];}
+bool cmp(const std::vector<word>&h,addr_t a,const std::vector<uint64_t>&e){addr_t pw=Q_COUNT*N;for(size_t i=0;i<e.size();++i){unsigned m=(i%pw)/N;uint64_t q=Q[m].to_uint64();if(h[a+i].to_uint64()%q!=e[i]%q){std::cerr<<"mismatch word="<<i<<" m="<<m<<" actual="<<h[a+i].to_uint64()%q<<" expected="<<e[i]%q<<'\n';return false;}}return true;}}
+int main(int ac,char**av){if(ac!=3){std::cerr<<"usage: test FIXTURE MKF_CONSTANT_FIXTURE\n";return 2;}std::string r=av[1],c=av[2];auto in=ld(r+"/input_ciphertext_q.bin"),k=ld(r+"/relinearization_keys_qp.bin"),u=ld(r+"/crs_u_qp.bin"),e=ld(r+"/expected_ciphertext_q.bin"),st=ld(r+"/stage_tensor_q.bin"),sr=ld(r+"/stage_after_right_external_q.bin"),sf=ld(r+"/stage_final_q.bin"),fq=ld(c+"/constants/ntt_forward_q.bin"),iq=ld(c+"/constants/ntt_inverse_q.bin"),fp=ld(c+"/constants/ntt_forward_p.bin"),ip=ld(c+"/constants/ntt_inverse_p.bin"),fm=ld(c+"/constants/ntt_forward_q_mul.bin"),im=ld(c+"/constants/ntt_inverse_q_mul.bin");
+addr_t z=0,ib=z;z=al(z+in.size());addr_t kb=z;z=al(z+k.size());addr_t ub=z;z=al(z+u.size());addr_t ob=z;z=al(z+e.size());addr_t fqb=z;z=al(z+fq.size());addr_t iqb=z;z=al(z+iq.size());addr_t fpb=z;z=al(z+fp.size());addr_t ipb=z;z=al(z+ip.size());addr_t fmb=z;z=al(z+fm.size());addr_t imb=z;z=al(z+im.size());addr_t sb=z;z=al(z+60ULL*R_COUNT*N);addr_t db=z;addr_t dt=z;z+=st.size();addr_t dr=z;z+=sr.size();addr_t df=z;z+=sf.size();z=al(z);addr_t rb=z;z+=7;std::vector<word>h(z);put(h,ib,in);put(h,kb,k);put(h,ub,u);put(h,fqb,fq);put(h,iqb,iq);put(h,fpb,fp);put(h,ipb,ip);put(h,fmb,fm);put(h,imb,im);std::cout<<"HBM bytes="<<h.size()*8ULL<<'\n';hls::stream<ap_uint<6>> phase_events;par1_kklss_bfv_kernel(h.data(),ib,kb,ub,ob,sb,fqb,iqb,fpb,ipb,fmb,imb,db,true,rb,phase_events);while(!phase_events.empty())phase_events.read();bool ok=true;ok&=cmp(h,dt,st);std::cout<<"tensor="<<ok<<'\n';bool rpass=cmp(h,dr,sr);std::cout<<"right="<<rpass<<'\n';ok&=rpass;bool fpass=cmp(h,df,sf);std::cout<<"nested="<<fpass<<'\n';ok&=fpass;bool opass=cmp(h,ob,e);ok&=opass;std::cout<<(opass?"KKLSS-BFV final: PASS":"KKLSS-BFV final: FAIL")<<"\ncounters=";for(int i=0;i<7;++i)std::cout<<(i?",":"")<<h[rb+i].to_uint64();std::cout<<'\n';return ok?0:1;}

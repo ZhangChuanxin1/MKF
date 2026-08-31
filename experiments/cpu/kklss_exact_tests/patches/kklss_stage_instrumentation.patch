@@ -1,0 +1,403 @@
+--- a/mkckks/evaluator.go
++++ b/mkckks/evaluator.go
+@@ -9,6 +9,7 @@
+ import "math"
+ import "unsafe"
+ import "errors"
++import "mk-lattigo/stageprof"
+ 
+ type Evaluator struct {
+ 	params    Parameters
+@@ -357,6 +358,8 @@
+ // some error.
+ // Returns an error if "minScale <= 0", ct.Scale = 0, ct.Level() = 0, ct.IsNTT() != true or if ct.Leve() != ctOut.Level()
+ func (eval *Evaluator) Rescale(ctIn *Ciphertext, minScale float64, ctOut *Ciphertext) (err error) {
++	profileStart := stageprof.Start()
++	defer stageprof.Add(stageprof.ModulusManagement, profileStart)
+ 
+ 	ringQ := eval.params.RingQ()
+ 
+@@ -557,7 +560,9 @@
+ // The procedure will panic if the evaluator was not created with an relinearization key.
+ func (eval *Evaluator) MulRelinHoistedNew(op0, op1 *Ciphertext, op0Hoisted, op1Hoisted *mkrlwe.HoistedCiphertext, rlkSet *mkrlwe.RelinearizationKeySet) (ctOut *Ciphertext) {
+ 	//ctOut = NewCiphertext(eval.params, op0.IDSet().Union(op1.IDSet()), utils.MinInt(op0.Level(), op1.Level()), 0)
++	profileStart := stageprof.Start()
+ 	ctOut = eval.newCiphertextBinary(op0, op1)
++	stageprof.Add(stageprof.MemoryMovement, profileStart)
+ 	ctOut.Scale = 0
+ 	eval.mulRelinHoisted(op0, op1, op0Hoisted, op1Hoisted, rlkSet, ctOut)
+ 	return
+--- a/mkrlwe/keyswitch.go
++++ b/mkrlwe/keyswitch.go
+@@ -3,6 +3,7 @@
+ import "github.com/ldsec/lattigo/v2/rlwe"
+ import "github.com/ldsec/lattigo/v2/ring"
+ import "math/bits"
++import "mk-lattigo/stageprof"
+ 
+ // KeySwitcher is a struct for RLWE key-switching.
+ type KeySwitcher struct {
+@@ -47,6 +48,8 @@
+ }
+ 
+ func (ks *KeySwitcher) Decompose(levelQ int, a *ring.Poly, ad *SwitchingKey) {
++	profileStart := stageprof.Start()
++	defer stageprof.Add(stageprof.Decomposition, profileStart)
+ 
+ 	params := ks.Parameters
+ 	ringQ := params.RingQ()
+@@ -99,22 +102,30 @@
+ 	c1QP := ks.Pool[1]
+ 
+ 	// Key switching with CRT decomposition for the Qi
++	profileStart := stageprof.Start()
+ 	for i := 0; i < beta; i++ {
+ 		ks.DecomposeSingleNTT(levelQ, levelP, alpha, i, params.Gamma(), aInvNTT, c0QP.Q, c0QP.P)
++	}
++	stageprof.Add(stageprof.Decomposition, profileStart)
+ 
++	profileStart = stageprof.Start()
++	for i := 0; i < beta; i++ {
+ 		if i == 0 {
+ 			ringQP.MulCoeffsMontgomeryLvl(levelQ, levelP, bg.Value[i], c0QP, c1QP)
+ 		} else {
+ 			ringQP.MulCoeffsMontgomeryAndAddLvl(levelQ, levelP, bg.Value[i], c0QP, c1QP)
+ 		}
+ 	}
++	stageprof.Add(stageprof.ExternalProduct, profileStart)
+ 
+ 	// rescale by P
+ 
++	profileStart = stageprof.Start()
+ 	ringQ.InvNTTLazyLvl(levelQ, c1QP.Q, c1QP.Q)
+ 	ringP.InvNTTLazyLvl(levelP, c1QP.P, c1QP.P)
+ 
+ 	ks.Baseconverter.ModDownQPtoQ(levelQ, levelP, c1QP.Q, c1QP.P, c)
++	stageprof.Add(stageprof.ModulusManagement, profileStart)
+ }
+ 
+ // MulRelin multiplies op0 with op1 with relinearization and returns the result in ctOut.
+--- a/mkrlwe/keyswitch_hoisted.go
++++ b/mkrlwe/keyswitch_hoisted.go
+@@ -2,6 +2,7 @@
+ 
+ import "github.com/ldsec/lattigo/v2/ring"
+ import "math/bits"
++import "mk-lattigo/stageprof"
+ 
+ // ExternalProduct applies internal product of input poly a & bg
+ // the expected result is ab
+@@ -21,6 +22,7 @@
+ 	c1QP := ks.Pool[1]
+ 
+ 	// Key switching with CRT decomposition for the Qi
++	profileStart := stageprof.Start()
+ 	for i := 0; i < beta; i++ {
+ 		//ks.DecomposeSingleNTT(levelQ, levelP, alpha, i, params.Gamma(), aInvNTT, c0QP.Q, c0QP.P)
+ 
+@@ -30,13 +32,16 @@
+ 			ringQP.MulCoeffsMontgomeryAndAddLvl(levelQ, levelP, bg.Value[i], aHoisted.Value[i], c1QP)
+ 		}
+ 	}
++	stageprof.Add(stageprof.ExternalProduct, profileStart)
+ 
+ 	// rescale by P
+ 
++	profileStart = stageprof.Start()
+ 	ringQ.InvNTTLazyLvl(levelQ, c1QP.Q, c1QP.Q)
+ 	ringP.InvNTTLazyLvl(levelP, c1QP.P, c1QP.P)
+ 
+ 	ks.Baseconverter.ModDownQPtoQ(levelQ, levelP, c1QP.Q, c1QP.P, c)
++	stageprof.Add(stageprof.ModulusManagement, profileStart)
+ }
+ 
+ // MulRelin multiplies op0 with op1 with relinearization and returns the result in ctOut.
+@@ -76,6 +81,7 @@
+ 	}
+ 
+ 	//gen x vector
++	profileStart := stageprof.Start()
+ 	for id := range idset0.Value {
+ 		if op0Hoisted == nil {
+ 			ks.Decompose(level, op0.Value[id], ks.swkPool3)
+@@ -115,8 +121,10 @@
+ 	for i := 0; i < beta; i++ {
+ 		ringQP.MFormLvl(level, levelP, y.Value[i], y.Value[i])
+ 	}
++	stageprof.Add(stageprof.ExternalProduct, profileStart)
+ 
+ 	//ctOut_0 <- op0_0 * op1_0
++	profileStart = stageprof.Start()
+ 	ringQ.NTTLvl(level, op0.Value["0"], ks.polyQPool[0])
+ 	ringQ.NTTLvl(level, op1.Value["0"], ks.polyQPool[1])
+ 
+@@ -142,6 +150,7 @@
+ 	for id := range ctOut.Value {
+ 		ringQ.InvNTTLvl(level, ctOut.Value[id], ctOut.Value[id])
+ 	}
++	stageprof.Add(stageprof.Tensor, profileStart)
+ 
+ 	//ctOut_j <- ctOut_j +  Ext(op1_j, x)
+ 	for id := range idset1.Value {
+@@ -150,7 +159,9 @@
+ 		} else {
+ 			ks.ExternalProductHoisted(level, op1Hoisted.Value[id], x, ks.polyQPool[0])
+ 		}
++		profileStart = stageprof.Start()
+ 		ringQ.AddLvl(level, ctOut.Value[id], ks.polyQPool[0], ctOut.Value[id])
++		stageprof.Add(stageprof.ExternalProduct, profileStart)
+ 	}
+ 
+ 	//ctOut_0 <- ctOut_0 + Ext(Ext(op0_i, y), v_i)
+@@ -171,10 +182,14 @@
+ 		ks.Decompose(level, ks.polyQPool[0], ks.swkPool3)
+ 
+ 		ks.ExternalProductHoisted(level, ks.swkPool3, v, ks.polyQPool[1])
++		profileStart = stageprof.Start()
+ 		ringQ.AddLvl(level, ctOut.Value["0"], ks.polyQPool[1], ctOut.Value["0"])
++		stageprof.Add(stageprof.ExternalProduct, profileStart)
+ 
+ 		ks.ExternalProductHoisted(level, ks.swkPool3, u, ks.polyQPool[2])
++		profileStart = stageprof.Start()
+ 		ringQ.AddLvl(level, ctOut.Value[id], ks.polyQPool[2], ctOut.Value[id])
++		stageprof.Add(stageprof.ExternalProduct, profileStart)
+ 	}
+ }
+ 
+--- a/mkbfv/evaluator.go
++++ b/mkbfv/evaluator.go
+@@ -3,6 +3,7 @@
+ import "mk-lattigo/mkrlwe"
+ 
+ import "github.com/ldsec/lattigo/v2/ring"
++import "mk-lattigo/stageprof"
+ 
+ type Evaluator struct {
+ 	params Parameters
+@@ -82,7 +83,9 @@
+ // The procedure will panic if either op0.Degree or op1.Degree > 1.
+ // The procedure will panic if the evaluator was not created with an relinearization key.
+ func (eval *Evaluator) MulRelinNew(op0, op1 *Ciphertext, rlkSet *RelinearizationKeySet) (ctOut *Ciphertext) {
++	profileStart := stageprof.Start()
+ 	ctOut = eval.newCiphertextBinary(op0, op1)
++	stageprof.Add(stageprof.MemoryMovement, profileStart)
+ 	eval.mulRelinHoisted(op0, op1, rlkSet, ctOut)
+ 	return
+ }
+@@ -116,7 +119,6 @@
+ // The procedure will panic if ctOut.Degree != op0.Degree + op1.Degree.
+ // The procedure will panic if the evaluator was not created with an relinearization key.
+ func (eval *Evaluator) mulRelinHoisted(ct0, ct1 *Ciphertext, rlkSet *RelinearizationKeySet, ctOut *Ciphertext) {
+-
+ 	ct0R := new(mkrlwe.Ciphertext)
+ 	ct0R.Value = make(map[string]*ring.Poly)
+ 	ct1R := new(mkrlwe.Ciphertext)
+--- a/mkbfv/keyswitch.go
++++ b/mkbfv/keyswitch.go
+@@ -2,6 +2,7 @@
+ 
+ import "mk-lattigo/mkrlwe"
+ import "github.com/ldsec/lattigo/v2/ring"
++import "mk-lattigo/stageprof"
+ 
+ type KeySwitcher struct {
+ 	*mkrlwe.KeySwitcher
+@@ -55,6 +56,8 @@
+ }
+ 
+ func (ks *KeySwitcher) DecomposeBFV(levelQ int, aR *ring.Poly, ad1, ad2 *mkrlwe.SwitchingKey) {
++	profileStart := stageprof.Start()
++	defer stageprof.Add(stageprof.Decomposition, profileStart)
+ 	params := ks.params
+ 	levelP := params.PCount() - 1
+ 	beta := params.Beta(levelQ)
+@@ -79,7 +82,7 @@
+ 	}
+ }
+ 
+-//output is in InvNTTForm
++// output is in InvNTTForm
+ func (ks *KeySwitcher) ExternalProductBFV(levelQ int, aR *ring.Poly, bg1, bg2 *mkrlwe.SwitchingKey, c *ring.Poly) {
+ 	params := ks.params
+ 	ringQ := params.RingQ()
+@@ -94,6 +97,7 @@
+ 	ks.DecomposeBFV(levelQ, aR, ks.swkPool1, ks.swkPool2)
+ 
+ 	// Key switching with CRT decomposition for the Qi
++	profileStart := stageprof.Start()
+ 	for i := 0; i < beta; i++ {
+ 		if i == 0 {
+ 			ringQP.MulCoeffsMontgomeryLvl(levelQ, levelP, bg1.Value[i], ks.swkPool1.Value[i], c1QP)
+@@ -103,11 +107,14 @@
+ 			ringQP.MulCoeffsMontgomeryAndAddLvl(levelQ, levelP, bg2.Value[i], ks.swkPool2.Value[i], c1QP)
+ 		}
+ 	}
++	stageprof.Add(stageprof.ExternalProduct, profileStart)
+ 
++	profileStart = stageprof.Start()
+ 	ringQ.InvNTTLazyLvl(levelQ, c1QP.Q, c1QP.Q)
+ 	ringP.InvNTTLazyLvl(levelP, c1QP.P, c1QP.P)
+ 
+ 	ks.Baseconverter.ModDownQPtoQ(levelQ, levelP, c1QP.Q, c1QP.P, c)
++	stageprof.Add(stageprof.ModulusManagement, profileStart)
+ }
+ 
+ // MulRelin multiplies op0 with op1 with relinearization and returns the result in ctOut.
+--- a/mkbfv/keyswitch_hoisted.go
++++ b/mkbfv/keyswitch_hoisted.go
+@@ -2,8 +2,9 @@
+ 
+ import "mk-lattigo/mkrlwe"
+ import "github.com/ldsec/lattigo/v2/ring"
++import "mk-lattigo/stageprof"
+ 
+-//output is in InvNTTForm
++// output is in InvNTTForm
+ func (ks *KeySwitcher) ExternalProductBFVHoisted(levelQ int, aHoisted1, aHoisted2, bg1, bg2 *mkrlwe.SwitchingKey, c *ring.Poly) {
+ 	params := ks.params
+ 	ringQ := params.RingQ()
+@@ -18,6 +19,7 @@
+ 	//ks.DecomposeBFV(levelQ, aR, ks.swkPool1, ks.swkPool2)
+ 
+ 	// Key switching with CRT decomposition for the Qi
++	profileStart := stageprof.Start()
+ 	for i := 0; i < beta; i++ {
+ 		if i == 0 {
+ 			ringQP.MulCoeffsMontgomeryLvl(levelQ, levelP, bg1.Value[i], aHoisted1.Value[i], c1QP)
+@@ -27,11 +29,14 @@
+ 			ringQP.MulCoeffsMontgomeryAndAddLvl(levelQ, levelP, bg2.Value[i], aHoisted2.Value[i], c1QP)
+ 		}
+ 	}
++	stageprof.Add(stageprof.ExternalProduct, profileStart)
+ 
++	profileStart = stageprof.Start()
+ 	ringQ.InvNTTLazyLvl(levelQ, c1QP.Q, c1QP.Q)
+ 	ringP.InvNTTLazyLvl(levelP, c1QP.P, c1QP.P)
+ 
+ 	ks.Baseconverter.ModDownQPtoQ(levelQ, levelP, c1QP.Q, c1QP.P, c)
++	stageprof.Add(stageprof.ModulusManagement, profileStart)
+ }
+ 
+ // MulRelin multiplies op0 with op1 with relinearization and returns the result in ctOut.
+@@ -84,6 +89,7 @@
+ 	}
+ 
+ 	//gen x vector
++	profileStart := stageprof.Start()
+ 	for id := range idset0.Value {
+ 		if op0Hoisted1 == nil {
+ 			ks.DecomposeBFV(level, op0.Value[id], ks.swkPool1, ks.swkPool2)
+@@ -132,41 +138,52 @@
+ 		ringQP.MFormLvl(level, levelP, y1.Value[i], y1.Value[i])
+ 		ringQP.MFormLvl(level, levelP, y2.Value[i], y2.Value[i])
+ 	}
++	stageprof.Add(stageprof.ExternalProduct, profileStart)
+ 
+ 	//ctOut_0 <- op0_0 * op1_0
++	profileStart = stageprof.Start()
+ 	ringR.NTT(op0.Value["0"], ks.polyRPool1)
+ 	ringR.NTT(op1.Value["0"], ks.polyRPool2)
+ 
+ 	ringR.MForm(ks.polyRPool1, ks.polyRPool1)
+ 	ringR.MulCoeffsMontgomery(ks.polyRPool1, ks.polyRPool2, ks.polyRPool3)
++	stageprof.Add(stageprof.Tensor, profileStart)
+ 	conv.Quantize(ks.polyRPool3, ctOut.Value["0"], params.T())
+ 
+ 	//ctOut_j <- op0_0 * op1_j + op0_j * op1_0
++	profileStart = stageprof.Start()
+ 	ringR.MForm(ks.polyRPool2, ks.polyRPool2)
++	stageprof.Add(stageprof.Tensor, profileStart)
+ 
+ 	for id := range idset0.Value {
+ 		if !idset1.Has(id) {
++			profileStart = stageprof.Start()
+ 			ringR.NTT(op0.Value[id], ks.polyRPool3)
+ 			ringR.MulCoeffsMontgomery(ks.polyRPool2, ks.polyRPool3, ks.polyRPool3)
++			stageprof.Add(stageprof.Tensor, profileStart)
+ 			conv.Quantize(ks.polyRPool3, ctOut.Value[id], params.T())
+ 		}
+ 	}
+ 
+ 	for id := range idset1.Value {
+ 		if !idset0.Has(id) {
++			profileStart = stageprof.Start()
+ 			ringR.NTT(op1.Value[id], ks.polyRPool3)
+ 			ringR.MulCoeffsMontgomery(ks.polyRPool1, ks.polyRPool3, ks.polyRPool3)
++			stageprof.Add(stageprof.Tensor, profileStart)
+ 			conv.Quantize(ks.polyRPool3, ctOut.Value[id], params.T())
+ 		}
+ 	}
+ 
+ 	for id := range idset1.Value {
+ 		if idset0.Has(id) {
++			profileStart = stageprof.Start()
+ 			ringR.NTT(op1.Value[id], ks.polyRPool3)
+ 			ringR.MulCoeffsMontgomery(ks.polyRPool1, ks.polyRPool3, ks.polyRPool3)
+ 
+ 			ringR.NTT(op0.Value[id], ks.polyRPool4)
+ 			ringR.MulCoeffsMontgomeryAndAdd(ks.polyRPool2, ks.polyRPool4, ks.polyRPool3)
++			stageprof.Add(stageprof.Tensor, profileStart)
+ 
+ 			conv.Quantize(ks.polyRPool3, ctOut.Value[id], params.T())
+ 		}
+@@ -179,7 +196,9 @@
+ 		} else {
+ 			ks.ExternalProductBFVHoisted(level, op1Hoisted1.Value[id], op1Hoisted2.Value[id], x1, x2, ks.polyQPool1)
+ 		}
++		profileStart = stageprof.Start()
+ 		ringQ.AddLvl(level, ctOut.Value[id], ks.polyQPool1, ctOut.Value[id])
++		stageprof.Add(stageprof.ExternalProduct, profileStart)
+ 	}
+ 
+ 	//ctOut_0 <- ctOut_0 + Inter(Inter(op0_i, y), v_i)
+@@ -199,9 +218,13 @@
+ 		ks.Decompose(level, ks.polyQPool1, ks.swkPool3)
+ 
+ 		ks.ExternalProductHoisted(level, ks.swkPool3, v, ks.polyQPool2)
++		profileStart = stageprof.Start()
+ 		ringQ.AddLvl(level, ctOut.Value["0"], ks.polyQPool2, ctOut.Value["0"])
++		stageprof.Add(stageprof.ExternalProduct, profileStart)
+ 
+ 		ks.ExternalProductHoisted(level, ks.swkPool3, u, ks.polyQPool2)
++		profileStart = stageprof.Start()
+ 		ringQ.AddLvl(level, ctOut.Value[id], ks.polyQPool2, ctOut.Value[id])
++		stageprof.Add(stageprof.ExternalProduct, profileStart)
+ 	}
+ }
+--- a/mkbfv/basis_extension.go
++++ b/mkbfv/basis_extension.go
+@@ -2,6 +2,7 @@
+ 
+ import "github.com/ldsec/lattigo/v2/ring"
+ import "mk-lattigo/mkrlwe"
++import "mk-lattigo/stageprof"
+ 
+ type FastBasisExtender struct {
+ 	ringP    *ring.Ring
+@@ -47,6 +48,8 @@
+ 
+ // assume input and output are in InvNTTForm
+ func (conv *FastBasisExtender) ModUpQtoR(polyQ, polyR *ring.Poly) {
++	profileStart := stageprof.Start()
++	defer stageprof.Add(stageprof.ModulusManagement, profileStart)
+ 
+ 	levelQ := len(conv.ringQ.Modulus) - 1
+ 	levelQMul := levelQ
+@@ -64,6 +67,8 @@
+ 
+ // assume input and output are in InvNTTForm
+ func (conv *FastBasisExtender) Quantize(polyR, polyQ *ring.Poly, t uint64) {
++	profileStart := stageprof.Start()
++	defer stageprof.Add(stageprof.ModulusManagement, profileStart)
+ 
+ 	levelQ := len(conv.ringQ.Modulus) - 1
+ 	levelQMul := levelQ
+@@ -81,6 +86,8 @@
+ 
+ // assume input polyQ is in InvNTTForm
+ func (conv *FastBasisExtender) Rescale(polyQ *ring.Poly, polyR *ring.Poly) {
++	profileStart := stageprof.Start()
++	defer stageprof.Add(stageprof.ModulusManagement, profileStart)
+ 
+ 	levelQ := len(conv.ringQ.Modulus) - 1
+ 	levelQMul := levelQ

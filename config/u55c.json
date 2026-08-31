@@ -1,0 +1,45 @@
+{
+  "schema": "mkf-u55c-port-config-v1",
+  "board": "AMD Alveo U55C",
+  "device_part": "xcu55c-fsvh2892-2L-e",
+  "platform_name": "xilinx_u55c_gen3x16_xdma_3_202210_1",
+  "platform_resolution": "platforminfo -l or PLATFORM_REPO_PATHS; no absolute path is embedded",
+  "toolchain_target": "Vitis/Vivado 2022.2",
+  "clock_profiles": {
+    "smoke": {
+      "period_ns": 10.0,
+      "purpose": "portable C-sim/csynth bring-up only"
+    },
+    "release300": {
+      "period_ns": 3.333,
+      "purpose": "paper target request; requires non-negative routed WNS/WHS and achieved-clock evidence"
+    }
+  },
+  "parameter_scope": {
+    "profile": "P1",
+    "ring_degree": 16384,
+    "parties": 16,
+    "schemes": ["MK-CKKS", "MK-BFV"],
+    "constructions": ["KKLSS", "MKF"]
+  },
+  "hls_targets": [
+    "kklss_ckks",
+    "mkf_ckks",
+    "kklss_bfv",
+    "mkf_bfv"
+  ],
+  "integration_status": {
+    "hls_part_configuration": "READY",
+    "c_sim": "NOT_RUN_ON_THIS_HOST",
+    "c_synth": "NOT_RUN_ON_THIS_HOST",
+    "vitis_link_and_route": "BLOCKED_PENDING_U55C_XRT_INTEGRATION",
+    "xrt_host": "BLOCKED_PENDING_IMPLEMENTATION",
+    "board_measurement": "BLOCKED"
+  },
+  "known_limitations": [
+    "The four top kernels expose one gmem0 AXI master, not a validated 32-channel HBM co-design.",
+    "phase_events is AXI-Stream and needs a U55C-compatible consumer or a revised measured-counter contract before v++ link.",
+    "No routed image, XRT host, achieved clock, resource report or board latency is included in this HLS-only release.",
+    "ResNet P2GN16 requires a separate production operand/payload/address/runtime contract and is not covered by the P1 primitive kernels."
+  ]
+}

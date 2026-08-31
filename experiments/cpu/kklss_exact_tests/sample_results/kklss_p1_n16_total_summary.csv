@@ -1,0 +1,3 @@
+scheme,parameter,parties,samples,warmup,mean_ms,median_ms,stddev_ms,min_ms,max_ms
+KKLSS-CKKS,P1,16,10,5,536.435571,536.768292,4.853581,530.772708,545.234000
+KKLSS-BFV,P1,16,10,5,912.924067,912.305000,16.147898,891.731625,935.850917
