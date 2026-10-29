@@ -1,0 +1,4 @@
+# Preserve source bytes bound by PUBLICATION_MANIFEST.sha256 across Git
+# staging, checkouts, GitHub source archives and platforms.
+* -text whitespace=cr-at-eol
+*.bin binary

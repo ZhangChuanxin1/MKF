@@ -1,0 +1,229 @@
+{
+  "schema": "mkf-project-layout-v1",
+  "release_stage": "initial_source_scaffold",
+  "generated_date": "2026-10-28",
+  "status_definitions": {
+    "SOURCE_AVAILABLE": "Implementation or harness source is present; no new execution or performance PASS is implied.",
+    "PARTIAL": "Research source is present, but required implementation or evidence gates remain incomplete.",
+    "PENDING_IMPLEMENTATION": "Documentation-only source/experiment location; no executable implementation is supplied.",
+    "REQUIRES_EXTERNAL_ASSETS": "Matching dataset, checkpoint or other external inputs must be supplied and validated separately."
+  },
+  "entries": [
+    {
+      "id": "cpu_correctness",
+      "path": "experiments/cpu/correctness",
+      "status": "SOURCE_AVAILABLE",
+      "title": "CPU correctness",
+      "source_refs": [
+        "software/mkf/mkf_cpu/ckks_test.go",
+        "software/mkf/mkf_cpu/bfv_test.go",
+        "software/kklss/mkckks/mkckks_test.go",
+        "software/kklss/mkbfv/mkbfv_test.go"
+      ]
+    },
+    {
+      "id": "cpu_latency",
+      "path": "experiments/cpu/latency",
+      "status": "PARTIAL",
+      "title": "CPU latency experiments",
+      "source_refs": [
+        "software/mkf/cmd/mkfbench/main.go",
+        "software/kklss/mkckks/mkckks_benchmark_test.go",
+        "software/kklss/mkbfv/mkbfv_bench_test.go"
+      ]
+    },
+    {
+      "id": "cpu_stages",
+      "path": "experiments/cpu/stage_breakdown",
+      "status": "SOURCE_AVAILABLE",
+      "title": "CPU stage attribution",
+      "source_refs": [
+        "software/mkf/stageprof/stageprof.go",
+        "software/kklss/stageprof/stageprof.go",
+        "experiments/cpu/kklss_exact_tests"
+      ]
+    },
+    {
+      "id": "cpu_noise",
+      "path": "experiments/cpu/noise_depth",
+      "status": "SOURCE_AVAILABLE",
+      "title": "Noise and multiplicative depth",
+      "source_refs": [
+        "software/mkf/mkf_cpu/noise_experiment_test.go",
+        "software/kklss/mkckks/noise_experiment_test.go",
+        "software/kklss/mkbfv/noise_experiment_test.go",
+        "experiments/noise/README.md"
+      ]
+    },
+    {
+      "id": "fpga_primitives",
+      "path": "experiments/fpga/primitives",
+      "status": "SOURCE_AVAILABLE",
+      "title": "U55C primitive experiments",
+      "source_refs": [
+        "hardware/u55c/hls/run_hls.tcl",
+        "scripts/run_u55c_hls.ps1",
+        "scripts/generate_fixtures.ps1"
+      ]
+    },
+    {
+      "id": "fpga_resources",
+      "path": "experiments/fpga/resources",
+      "status": "PARTIAL",
+      "title": "U55C arithmetic resource evaluation",
+      "source_refs": [
+        "hardware/u55c/micro/run_micro.tcl",
+        "hardware/u55c/rtl/run_rtl.tcl"
+      ]
+    },
+    {
+      "id": "fpga_rotation",
+      "path": "experiments/fpga/rotation",
+      "status": "PARTIAL",
+      "title": "Rotation experiment staging",
+      "source_refs": [
+        "software/mkf/mkf_cpu/rotation_fixture_test.go",
+        "software/mkf/mkf_cpu/true_mkf_ckks_test.go"
+      ]
+    },
+    {
+      "id": "mnist_kklss",
+      "path": "experiments/cnn/mnist/kklss",
+      "status": "REQUIRES_EXTERNAL_ASSETS",
+      "title": "KKLSS MNIST CNN",
+      "source_refs": [
+        "software/kklss/cnn/cnn.go",
+        "software/kklss/cnn/cnn_test.go",
+        "software/kklss/cnn/cnn_bench_test.go",
+        "scripts/convert_mnist_idx.py"
+      ]
+    },
+    {
+      "id": "mnist_mkf",
+      "path": "experiments/cnn/mnist/mkf",
+      "status": "PENDING_IMPLEMENTATION",
+      "title": "MKF MNIST CNN",
+      "source_refs": []
+    },
+    {
+      "id": "resnet_plaintext",
+      "path": "experiments/cnn/resnet20/plaintext",
+      "status": "REQUIRES_EXTERNAL_ASSETS",
+      "title": "ResNet-20 plaintext reference",
+      "source_refs": [
+        "experiments/resnet20/plain_reference_trace.py",
+        "experiments/resnet20/calibrate_activation_scales.py"
+      ]
+    },
+    {
+      "id": "resnet_cpu",
+      "path": "experiments/cnn/resnet20/cpu",
+      "status": "PARTIAL",
+      "title": "ResNet-20 CPU research paths",
+      "source_refs": [
+        "software/mkf/mkf_cpu/resnet20_full_executor_test.go",
+        "software/mkf/mkf_cpu/true_mkf_resnet20_executor_test.go",
+        "software/mkf/mkf_cpu/p2gn16_matched_cpu_benchmark_test.go",
+        "software/mkf/mkf_cpu/p2gn16_production_export_disabled.go"
+      ]
+    },
+    {
+      "id": "resnet_fpga",
+      "path": "experiments/cnn/resnet20/fpga",
+      "status": "PENDING_IMPLEMENTATION",
+      "title": "ResNet-20 U55C experiment",
+      "source_refs": []
+    },
+    {
+      "id": "hardware_host",
+      "path": "hardware/u55c/host",
+      "status": "PENDING_IMPLEMENTATION",
+      "title": "U55C XRT host integration",
+      "source_refs": []
+    },
+    {
+      "id": "hardware_connectivity",
+      "path": "hardware/u55c/connectivity",
+      "status": "PENDING_IMPLEMENTATION",
+      "title": "U55C connectivity and HBM mapping",
+      "source_refs": []
+    },
+    {
+      "id": "hardware_integration",
+      "path": "hardware/u55c/integration",
+      "status": "PENDING_IMPLEMENTATION",
+      "title": "U55C full-design build integration",
+      "source_refs": []
+    },
+    {
+      "id": "hardware_validation",
+      "path": "hardware/u55c/validation",
+      "status": "PENDING_IMPLEMENTATION",
+      "title": "U55C board validation",
+      "source_refs": []
+    },
+    {
+      "id": "hardware_mnist",
+      "path": "hardware/u55c/cnn/mnist",
+      "status": "PENDING_IMPLEMENTATION",
+      "title": "U55C MNIST CNN accelerator",
+      "source_refs": []
+    },
+    {
+      "id": "hardware_resnet",
+      "path": "hardware/u55c/cnn/resnet20",
+      "status": "PENDING_IMPLEMENTATION",
+      "title": "U55C ResNet-20 accelerator",
+      "source_refs": []
+    },
+    {
+      "id": "software_mnist",
+      "path": "software/mkf/cnn/mnist",
+      "status": "PENDING_IMPLEMENTATION",
+      "title": "MKF MNIST software implementation",
+      "source_refs": []
+    },
+    {
+      "id": "software_resnet",
+      "path": "software/mkf/cnn/resnet20",
+      "status": "PARTIAL",
+      "title": "MKF ResNet-20 source index",
+      "source_refs": [
+        "software/mkf/mkf_cpu/true_mkf_resnet20_executor_test.go",
+        "software/mkf/mkf_cpu/resnet20_full_executor_test.go"
+      ]
+    },
+    {
+      "id": "data_mnist",
+      "path": "datasets/mnist",
+      "status": "REQUIRES_EXTERNAL_ASSETS",
+      "title": "MNIST assets",
+      "source_refs": [
+        "scripts/convert_mnist_idx.py",
+        "software/kklss/cnn/data/k1.txt",
+        "software/kklss/cnn/data/FC1.txt",
+        "software/kklss/cnn/data/FC2.txt",
+        "software/kklss/cnn/data/B1.txt",
+        "software/kklss/cnn/data/B2.txt"
+      ]
+    },
+    {
+      "id": "data_cifar",
+      "path": "datasets/cifar10",
+      "status": "REQUIRES_EXTERNAL_ASSETS",
+      "title": "CIFAR-10 assets",
+      "source_refs": [
+        "datasets/README.md"
+      ]
+    },
+    {
+      "id": "data_checkpoints",
+      "path": "datasets/checkpoints",
+      "status": "REQUIRES_EXTERNAL_ASSETS",
+      "title": "Checkpoints and folded weights",
+      "source_refs": [
+        "datasets/README.md"
+      ]
+    }
+  ]
+}

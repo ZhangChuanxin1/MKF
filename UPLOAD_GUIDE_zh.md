@@ -1,80 +1,61 @@
-# GitHub 上传指南（U55C 专用发布）
+# 后续 GitHub 发布步骤
 
-## 先确认两个边界
-
-1. 当前发布目录是 U55C 目标的 HLS/软件复现包，不是已经完成板测的
-   U55C 加速器。README 中的证据状态不要改成板测通过。
-2. 双盲投稿应使用与作者身份无关的中性账户或组织。仓库名称匿名并不足够；
-   账户名、提交作者、推送者和旧 Git 历史都可能暴露身份。
-
-本机在未认证状态下无法读取你给出的远端（返回 404 或要求凭据），因此
-本文档不猜测默认分支，也不会自动推送。
+本次按用户要求只整理本地发布包，未创建 Git 提交、未上传远端。
+本指南不绑定仓库或账户，也不会自动改写旧历史。
 
 ## 1. 发布前检查
 
-在本目录运行：
+先决定原创 MKF/硬件代码的许可证，保留第三方许可证和必要归属声明。
+确认 README 中所有“未完成/推算/作者提供”的边界均保留。
 
 ```powershell
-py -3 scripts/publication_scan.py --write-manifest
+py -3 scripts/publication_scan.py --verify-manifest
+py -3 -m unittest discover -s tests -v
 pwsh -NoProfile -File scripts/run_suite.ps1 -Profile smoke
 ```
 
-必须得到 publication scan `PASS` 和 smoke `PASS`。如果你已经生成了大型
-fixture，请保持它们在被 `.gitignore` 排除的 `fixtures/generated/` 中，且
-不要用普通 Git 提交。
+如果你有意改过源代码/文档，先审查改动，再运行
+`py -3 scripts/publication_scan.py --write-manifest` 更新清单并重新验证。
+不要用更新清单来掩盖未知改动。
 
-还需由仓库所有者决定并添加原创 MKF/硬件代码的许可证。第三方 KKLSS 的
-CC BY-NC 2.0 许可证必须保留。
+生成新源码 ZIP（输出必须在发布目录之外，拒绝覆盖已有压缩包）：
 
-## 2. 推荐方案：新建全新的中性空仓库
+```powershell
+py -3 scripts/make_source_zip.py --output ../MKFHE_FPGA_U55C_sources.zip
+```
 
-这是双盲和彻底隔离旧历史时最安全的方案。先在 GitHub 中创建空仓库，不要
-自动生成 README、LICENSE 或 `.gitignore`，然后在本目录执行：
+ZIP 自动排除 `.local`、缓存、生成 fixture 等；不要把运行日志或大型数据
+直接加入普通 Git。不要通过网页逐个上传文件，使用 Git 可避免网页文件数限制。
+
+## 2. 后续推送到新的空仓库
+
+只有你确认账户、目标仓库、许可和公开范围后，才执行下列命令。
+将 `<REMOTE_URL>` 换成你自己的仓库 URL，不要直接复制占位符：
 
 ```powershell
 git init -b main
-git config user.name "Anonymous Authors"
-git config user.email "anonymous@users.noreply.github.com"
-git add .gitattributes .gitignore README.md THIRD_PARTY_NOTICES.md `
-  UPLOAD_GUIDE_zh.md requirements-software.txt PUBLICATION_MANIFEST.sha256 `
-  config docs experiments fixtures hardware scripts software
+git add .
 git status --short
 git diff --cached --check
-git commit -m "Release U55C reproducibility artifact"
+git commit -m "Organize MKF experiments and U55C source artifact"
 git remote add origin <REMOTE_URL>
-git ls-remote --symref origin HEAD
-git push -u origin HEAD:main
+git push -u origin main
 ```
 
-逐项检查 `git status --short`，确认没有 `.local/`、生成 fixture、综合输出、
-旧报告或个人路径后再提交。不要直接把整个论文工作区设为 remote。
+在提交前检查暂存区没有 `.local/`、数据集、生成 fixture、板卡镜像、个人
+路径和密钥。如果命令报错，先保留输出并检查；不要强制推送来绕过错误。
 
-## 3. 如果必须使用已有仓库
+## 3. 已有仓库
 
-先认证并确认远端，不要猜默认分支：
+先另行 clone 到新的目录，把本包文件复制进去，排除 `.git`、`.local`、
+缓存和大型数据。查看 `git status` / `git diff` 后再提交；不要覆盖你正在
+使用的旧工作区，也不要自动删除远端已有文件。
 
-```powershell
-gh auth status
-gh repo view <OWNER/REPOSITORY>
-git ls-remote --symref <REMOTE_URL> HEAD
-```
+旧仓库历史、账户和提交者可能暴露身份。新分支并不能清理旧历史；双盲
+投稿应另行审查账户/历史/Release。此包的字符串扫描不是匿名性证明，第三方
+法律归属也不能为匿名而抹除。登录时不要将令牌或密码贴到聊天或 README。
 
-建议把本发布目录作为一条新分支推送：
+## 4. 上传后
 
-```powershell
-git remote add origin <REMOTE_URL>
-git push -u origin HEAD:u55c-artifact
-```
-
-这不会清除旧提交中的敏感对象。如果旧仓库历史、tag 或 Release 资产中已经
-包含不应公开的内容，新分支并不能完成匿名化。此时优先新建空仓库；历史重写
-和强制推送具有破坏性，必须先备份并由你明确决定，本指南不自动执行。
-
-## 4. 推送后核对
-
-- 在网页上确认 README 的硬件状态仍是 HLS-only。
-- 确认仓库中不存在 `.local/`、`fixtures/generated/` 和工具输出。
-- 下载一个全新副本，重新运行 publication scan 与 smoke。
-- 只有在装有 Vitis/Vivado 2022.2 和精确 U55C 平台的主机上，才运行
-  `u55c-csim` 或 `u55c-csynth`。
-- 不要把 C-sim、C-synth 或请求时钟写成板上实测结果。
+下载全新副本，重跑 manifest、unit tests 和 smoke。只在具备对应工具和
+资源的机器上运行重实验。不得把 HLS 配置、请求时钟或投影图写成板测通过。

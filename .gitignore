@@ -1,0 +1,44 @@
+# Local evidence and generated data
+.local/
+fixtures/generated/
+PUBLICATION_SCAN.json
+
+# FPGA tool output
+.Xil/
+_x/
+build/
+*.bit
+*.dcp
+*.jou
+*.log
+*.pdi
+*.rpt
+*.str
+*.vcd
+*.wdb
+*.xclbin
+*.xo
+*.xsa
+
+# Language/tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+coverage.out
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
+
+# Local datasets and regenerated figure outputs
+datasets/local/
+software/kklss/cnn/data/mnist_test.csv
+software/kklss/cnn/data/mnist_test.csv.metadata.json
+figures/**/*.pdf
+figures/**/*.png
+figures/**/*.svg
+*.pt
+*.tar.gz

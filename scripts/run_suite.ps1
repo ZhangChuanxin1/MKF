@@ -22,7 +22,7 @@ function Invoke-GoTest([string]$WorkingDirectory, [string]$Package, [string]$Pat
     $log = Join-Path $runDir "${Name}.log"
     Push-Location $WorkingDirectory
     try {
-        & go test $Package -run $Pattern -count=1 2>&1 | Tee-Object -FilePath $log
+        & go test $Package -p 1 -parallel 1 -run $Pattern -count=1 2>&1 | Tee-Object -FilePath $log
         if ($LASTEXITCODE -ne 0) {
             throw "Go test failed: $Name. See $log"
         }
@@ -32,6 +32,11 @@ function Invoke-GoTest([string]$WorkingDirectory, [string]$Package, [string]$Pat
     }
 }
 
+$lockPath = Join-Path $repoRoot '.local/experiment.lock'
+try {
+    $suiteLock = [IO.File]::Open($lockPath,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+} catch { throw 'Another artifact experiment holds the local lock. Do not interrupt it.' }
+try {
 $requireU55C = $Profile -in @('u55c-csim', 'u55c-csynth')
 & (Join-Path $PSScriptRoot 'preflight.ps1') -RunDir $runDir -PythonExe $PythonExe -RequireU55C:$requireU55C
 
@@ -121,3 +126,7 @@ $summary = [ordered]@{
 $summary | ConvertTo-Json -Depth 4 |
     Set-Content -LiteralPath (Join-Path $runDir 'RUN_SUMMARY.json') -Encoding UTF8
 Write-Host "Profile $Profile PASS. Local evidence: $runDir"
+}
+finally {
+    $suiteLock.Dispose()
+}

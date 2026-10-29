@@ -1,0 +1,1850 @@
+package mkfcpu
+
+// This file is the fail-closed CPU measurement adapter for the already
+// validated proposed-MKF n+1 ResNet-20 executor.  It deliberately does not
+// reuse ExecutePhase: that functional path loads and encrypts model material
+// and decrypts every boundary.  Here all key generation, file loading,
+// packing, owner encryption, and plaintext-reference work happens in
+// NewTrial/PrepareSegment; the prepared segment's Run method contains online
+// homomorphic evaluation and the required collective refreshes only.
+
+import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"math"
+	"math/cmplx"
+	"os"
+	"runtime"
+	"sync"
+	"testing"
+
+	"github.com/ldsec/lattigo/v2/ckks"
+	"github.com/ldsec/lattigo/v2/dckks"
+	"github.com/ldsec/lattigo/v2/rlwe"
+	"github.com/ldsec/lattigo/v2/utils"
+)
+
+const (
+	paperMKFResNet20CPUFixture  = "cifar10-test-00000:record-sha256=35ce668430e638d9f487715a81e2051fc1b8ca1263461ce72179c29bfdbc1ee8:activation-scales-sha256=ea9e6bad9179fbf1bff4209b741ca7a199def0c1b56ccd8b5d80e1d4b4bfae86"
+	paperMKFResNet20CPUBoundary = "online-only proposed-MKF evaluation: encrypted Stem, nine Residual Blocks, and checkpoint-faithful GAP+FC; includes n+1 aggregate folding, aggregate relinearization, party-specific rotations, rescaling/modulus management, the carrier/state copies used by the shared network scheduler, and 22 two-party collective refresh rounds; excludes offline key generation, evaluation-key generation, fixture/model loading, plaintext packing, owner encryption, ciphertext serialization accounting, decryption, and correctness verification"
+)
+
+// paperMKFCPUMessageBytePolicy freezes what a future 0-warm-up/10-trial run
+// will report.  Byte counts are exact lengths of Lattigo v2.3.0's current
+// uncompressed MarshalBinary encodings, not estimates and not network time.
+// Transport framing and transport latency are outside the CPU kernel table.
+type paperMKFCPUMessageBytePolicy struct {
+	Schema                  string `json:"schema"`
+	OwnerIngressEncoding    string `json:"owner_ingress_encoding"`
+	RefreshShareEncoding    string `json:"refresh_share_encoding"`
+	EvaluationKeyEncoding   string `json:"evaluation_key_encoding"`
+	EvaluationKeyScope      string `json:"evaluation_key_scope"`
+	OnlineTimingScope       string `json:"online_timing_scope"`
+	TransportScope          string `json:"transport_scope"`
+	CKSIngressShareMessages int    `json:"cks_ingress_share_messages"`
+}
+
+type paperMKFCPUStageCommunication struct {
+	Stage                   resNet20CPUStage `json:"stage"`
+	OwnerIngressCiphertexts int              `json:"owner_ingress_ciphertexts"`
+	OwnerIngressBytes       uint64           `json:"owner_ingress_bytes"`
+	RefreshRounds           int              `json:"refresh_rounds"`
+	RefreshShareMessages    int              `json:"refresh_share_messages"`
+	RefreshShareBytes       uint64           `json:"refresh_share_bytes"`
+}
+
+type paperMKFCPUTrialCommunication struct {
+	Trial                 int                                                `json:"trial"`
+	EvaluationKeyPayloads int                                                `json:"evaluation_key_payloads"`
+	EvaluationKeyBytes    uint64                                             `json:"evaluation_key_bytes"`
+	Stages                map[resNet20CPUStage]paperMKFCPUStageCommunication `json:"stages"`
+}
+
+type paperMKFResNet20CPUBackend struct {
+	mu             sync.Mutex
+	communications []paperMKFCPUTrialCommunication
+	requestOnce    sync.Once
+	request        fullResNet20Request
+	requestErr     error
+}
+
+func (backend *paperMKFResNet20CPUBackend) Implementation() string { return "MKF-CPU" }
+func (backend *paperMKFResNet20CPUBackend) ConstructionID() string { return paperMKFCKKSConstructionID }
+func (backend *paperMKFResNet20CPUBackend) ParameterID() string    { return "P2" }
+func (backend *paperMKFResNet20CPUBackend) Parties() int           { return fullResNet20Parties }
+func (backend *paperMKFResNet20CPUBackend) FixtureID() string      { return paperMKFResNet20CPUFixture }
+func (backend *paperMKFResNet20CPUBackend) MeasurementBoundary() string {
+	return paperMKFResNet20CPUBoundary
+}
+
+func (backend *paperMKFResNet20CPUBackend) CommunicationBytePolicy() paperMKFCPUMessageBytePolicy {
+	return paperMKFCPUMessageBytePolicy{
+		Schema:                  "true-mkf-resnet20-cpu-message-byte-policy-v1",
+		OwnerIngressEncoding:    "sum len(Ciphertext.MarshalBinary()) over the 6201 sparse n+1 owner ciphertexts, measured during untimed staging",
+		RefreshShareEncoding:    "22 rounds times two parties times len(dckks.RefreshShare.MarshalBinary()) for the fixed minLevel-to-MaxLevel share shape, measured outside the timer",
+		EvaluationKeyEncoding:   "sum of exact MarshalBinary lengths via GetDataLen(true): one payload per party-specific fold switching key, one aggregate relinearization-key payload, and one party-specific switching-key payload per required rotation",
+		EvaluationKeyScope:      "one-time offline public evaluation material generated by the test-side centralized EvalKeyGen harness; excludes public-encryption keys and does not evidence a distributed EvalKeyGen transcript",
+		OnlineTimingScope:       "Run includes fold, refresh-share generation, aggregation, finalize, and repeated-Gamma materialization; byte-size accounting and MarshalBinary are excluded",
+		TransportScope:          "current uncompressed Lattigo v2.3.0 encoding only; excludes framing, copies, sockets, and network latency",
+		CKSIngressShareMessages: 0,
+	}
+}
+
+func paperMKFExpectedStageCommunication(stage resNet20CPUStage) (ownerCiphertexts, refreshRounds int, ok bool) {
+	switch stage {
+	case resNet20CPUStem:
+		return 31, 1, true
+	case resNet20CPUResidual:
+		return 6168, 21, true
+	case resNet20CPUFullyConn:
+		return 2, 0, true
+	default:
+		return 0, 0, false
+	}
+}
+
+func (backend *paperMKFResNet20CPUBackend) CommunicationEvidence() []paperMKFCPUTrialCommunication {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	result := make([]paperMKFCPUTrialCommunication, len(backend.communications))
+	for index, trial := range backend.communications {
+		result[index] = paperMKFCPUTrialCommunication{
+			Trial: trial.Trial, EvaluationKeyPayloads: trial.EvaluationKeyPayloads,
+			EvaluationKeyBytes: trial.EvaluationKeyBytes,
+			Stages:             make(map[resNet20CPUStage]paperMKFCPUStageCommunication, len(trial.Stages)),
+		}
+		for stage, evidence := range trial.Stages {
+			result[index].Stages[stage] = evidence
+		}
+	}
+	return result
+}
+
+func (backend *paperMKFResNet20CPUBackend) CommunicationArtifacts() (json.RawMessage, json.RawMessage, error) {
+	evidence := backend.CommunicationEvidence()
+	if len(evidence) != resNet20CPUTrials {
+		return nil, nil, fmt.Errorf("paper-MKF communication evidence has %d trials, want %d", len(evidence), resNet20CPUTrials)
+	}
+	for index, trial := range evidence {
+		if trial.Trial != index+1 || trial.EvaluationKeyPayloads <= 0 || trial.EvaluationKeyBytes == 0 || len(trial.Stages) != len(resNet20CPUStages) {
+			return nil, nil, fmt.Errorf("paper-MKF communication trial %d is incomplete: %+v", index+1, trial)
+		}
+		if index > 0 {
+			if trial.EvaluationKeyPayloads != evidence[0].EvaluationKeyPayloads || trial.EvaluationKeyBytes != evidence[0].EvaluationKeyBytes {
+				return nil, nil, fmt.Errorf("paper-MKF evaluation-key byte evidence changed between trials 1 and %d", index+1)
+			}
+			for _, stage := range resNet20CPUStages {
+				if trial.Stages[stage] != evidence[0].Stages[stage] {
+					return nil, nil, fmt.Errorf("paper-MKF %s message-byte evidence changed between trials 1 and %d", stage, index+1)
+				}
+			}
+		}
+	}
+	policyJSON, err := json.Marshal(backend.CommunicationBytePolicy())
+	if err != nil {
+		return nil, nil, err
+	}
+	evidenceJSON, err := json.Marshal(struct {
+		Schema string                          `json:"schema"`
+		Trials []paperMKFCPUTrialCommunication `json:"trials"`
+	}{Schema: "true-mkf-resnet20-cpu-message-byte-evidence-v1", Trials: evidence})
+	if err != nil {
+		return nil, nil, err
+	}
+	return policyJSON, evidenceJSON, nil
+}
+
+func (backend *paperMKFResNet20CPUBackend) recordCommunication(evidence paperMKFCPUTrialCommunication) {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	evidence.Trial = len(backend.communications) + 1
+	backend.communications = append(backend.communications, evidence)
+}
+
+func (backend *paperMKFResNet20CPUBackend) NewTrial() (resNet20CPUPreparedTrial, error) {
+	backend.requestOnce.Do(func() {
+		backend.request, backend.requestErr = paperMKFCPURequestFromEnvironment()
+	})
+	if backend.requestErr != nil {
+		return nil, backend.requestErr
+	}
+	return newPaperMKFResNet20CPUTrial(backend, backend.request)
+}
+
+func newAuditedPaperMKFResNet20CPUBackend() (resNet20CPUBackend, error) {
+	return &paperMKFResNet20CPUBackend{}, nil
+}
+
+func init() {
+	auditedResNet20MKFCPUBackendFactory = newAuditedPaperMKFResNet20CPUBackend
+}
+
+func paperMKFCPURequestFromEnvironment() (fullResNet20Request, error) {
+	scales, err := loadFullResNet20Calibration(os.Getenv("MKF_RESNET20_ACTIVATION_SCALES_JSON"))
+	if err != nil {
+		return fullResNet20Request{}, fmt.Errorf("load frozen activation scales: %w", err)
+	}
+	plan, err := buildFullResNet20Plan(scales)
+	if err != nil {
+		return fullResNet20Request{}, err
+	}
+	plan.Communication.CKSIngressShareMessages = 0
+	plan.Communication.CKSIngressBytes = 0
+	fixture, err := loadFullResNet20OfficialFixture(os.Getenv("MKF_RESNET20_CIFAR_FIXTURE_DIR"))
+	if err != nil {
+		return fullResNet20Request{}, fmt.Errorf("load frozen CIFAR fixture: %w", err)
+	}
+	weightsDirectory := os.Getenv("MKF_RESNET20_WEIGHTS_DIR")
+	biasPath := os.Getenv("MKF_RESNET20_FC_BIAS_PATH")
+	if weightsDirectory == "" || biasPath == "" {
+		return fullResNet20Request{}, fmt.Errorf("MKF_RESNET20_WEIGHTS_DIR and MKF_RESNET20_FC_BIAS_PATH are required")
+	}
+	if _, err := auditFullResNet20FrozenInventory(plan, weightsDirectory, biasPath); err != nil {
+		return fullResNet20Request{}, fmt.Errorf("audit frozen checkpoint inventory: %w", err)
+	}
+	biasData, err := os.ReadFile(biasPath)
+	if err != nil {
+		return fullResNet20Request{}, err
+	}
+	if digest := fmt.Sprintf("%x", sha256.Sum256(biasData)); digest != fullResNet20CheckpointFCBiasSHA {
+		return fullResNet20Request{}, fmt.Errorf("checkpoint FC-bias SHA-256 mismatch: %s", digest)
+	}
+	if scales.SourceSHA256 != "ea9e6bad9179fbf1bff4209b741ca7a199def0c1b56ccd8b5d80e1d4b4bfae86" {
+		return fullResNet20Request{}, fmt.Errorf("activation-scale artifact mismatch: %s", scales.SourceSHA256)
+	}
+	return fullResNet20Request{
+		Parameter: "P2", Mode: fullResNet20PerformanceMode, Plan: plan, Fixture: fixture,
+		WeightsDirectory: weightsDirectory, CheckpointBiasPath: biasPath,
+	}, nil
+}
+
+// newPaperMKFPerformanceExecutor duplicates only the functional constructor's
+// offline setup.  It never invokes ExecutePhase and never places a plaintext
+// oracle in a timed method.  Forming s_E remains isolated to test-side
+// EvalKeyGen and to the post-timing verifier; its time is excluded.
+func newPaperMKFPerformanceExecutor(request fullResNet20Request) (*encryptedFullResNet20Executor, error) {
+	if request.Mode != fullResNet20PerformanceMode || request.Parameter != "P2" {
+		return nil, fmt.Errorf("paper-MKF CPU backend requires frozen P2 performance mode")
+	}
+	if len(request.Plan.Phases) != 12 || request.Plan.Expected != (fullResNet20Counts{DataInputCiphertexts: 3, ModelWeightCiphertexts: 6172, ModelBiasCiphertexts: 26, CiphertextProducts: 6172, RotationCalls: 6499, CollectiveRefreshes: 22, Degree59Activations: 19, PublicMaskProducts: 341, PackingOrTailRescaleLevels: 8}) {
+		return nil, fmt.Errorf("paper-MKF CPU backend requires the exact frozen 12-phase operation plan")
+	}
+	params, err := fullResNet20Parameters("P2")
+	if err != nil {
+		return nil, err
+	}
+	minLevel, logBound, ok := dckks.GetMinimumLevelForBootstrapping(128, params.Scale(), fullResNet20Parties, params.Q())
+	if !ok {
+		return nil, fmt.Errorf("P2 lacks levels for the two-party collective refresh")
+	}
+	refreshCRS, err := utils.NewPRNG()
+	if err != nil {
+		return nil, fmt.Errorf("create refresh CRS: %w", err)
+	}
+	keyGenerator := ckks.NewKeyGenerator(params)
+	shares := make([]*rlwe.SecretKey, fullResNet20Parties)
+	public := make([]*rlwe.PublicKey, fullResNet20Parties)
+	for party := range shares {
+		shares[party], public[party] = keyGenerator.GenKeyPair()
+	}
+	keys, aggregate, err := newPaperMKFCKKSTestMaterial(params, shares, fullResNet20RotationKeys())
+	if err != nil {
+		return nil, fmt.Errorf("generate offline test-side proposed-MKF evaluation material: %w", err)
+	}
+	online, err := newPaperMKFCKKSEvaluator(params, fullResNet20Parties, keys)
+	if err != nil {
+		return nil, err
+	}
+	adapter := newPaperMKFLattigoAdapter(online)
+	return &encryptedFullResNet20Executor{
+		request: request, params: params, encoder: ckks.NewEncoder(params), shares: shares,
+		public: public, aggregate: aggregate, evaluator: adapter, paperAdapter: adapter,
+		minLevel: minLevel, logBound: logBound, refreshCRS: refreshCRS,
+	}, nil
+}
+
+type paperMKFStagedOwnerCiphertext struct {
+	label      string
+	ciphertext *ckks.Ciphertext
+	wireBytes  uint64
+	// materialize is nil for the legacy n+1 backend. The canonical guarded
+	// backend sets it to the timed FoldToAggregate+guard-rescale closure; owner
+	// encryption and packing have already completed before this closure runs.
+	materialize func() (*ckks.Ciphertext, error)
+}
+
+type paperMKFStagedOwnerEvaluator struct {
+	ckks.Evaluator
+	entries []paperMKFStagedOwnerCiphertext
+	next    int
+}
+
+func (staged *paperMKFStagedOwnerEvaluator) ownerCarrier(_ ckks.Encoder, _ []*rlwe.PublicKey, owner int, _ []complex128) (*ckks.Ciphertext, error) {
+	if owner != realResNetTailModelOwner {
+		return nil, fmt.Errorf("timed model queue requested owner %d", owner)
+	}
+	return nil, fmt.Errorf("timed model queue requires a labeled take; dynamic owner encryption is disabled")
+}
+
+func (staged *paperMKFStagedOwnerEvaluator) take(label string) (*ckks.Ciphertext, error) {
+	if staged.next >= len(staged.entries) {
+		return nil, fmt.Errorf("staged model queue exhausted at %s", label)
+	}
+	entry := staged.entries[staged.next]
+	if entry.label != label || entry.ciphertext == nil {
+		return nil, fmt.Errorf("staged model queue[%d]=%q, want %q", staged.next, entry.label, label)
+	}
+	staged.next++
+	if entry.materialize != nil {
+		materialized, err := entry.materialize()
+		if err != nil {
+			return nil, fmt.Errorf("materialize staged owner %s: %w", label, err)
+		}
+		if materialized == nil {
+			return nil, fmt.Errorf("materialize staged owner %s returned nil", label)
+		}
+		return materialized, nil
+	}
+	return entry.ciphertext, nil
+}
+
+func (staged *paperMKFStagedOwnerEvaluator) requireConsumed() error {
+	if staged.next != len(staged.entries) {
+		return fmt.Errorf("timed segment consumed %d/%d staged owner ciphertexts", staged.next, len(staged.entries))
+	}
+	return nil
+}
+
+type paperMKFResNet20CPUTrial struct {
+	backend               *paperMKFResNet20CPUBackend
+	request               fullResNet20Request
+	executor              *encryptedFullResNet20Executor
+	inputCiphertexts      []*ckks.Ciphertext
+	current               *ckks.Ciphertext
+	reference             []complex128
+	nextPhase             int
+	active                *paperMKFResNet20CPUSegment
+	verified              bool
+	ownerCount            int
+	communication         map[resNet20CPUStage]paperMKFCPUStageCommunication
+	refreshShareSize      uint64
+	evaluationKeyPayloads int
+	evaluationKeyBytes    uint64
+	// The fields below are nil/false for the frozen legacy proposed-MKF
+	// benchmark. They let the independently registered P2GN16 canonical
+	// backend reuse only the audited phase preparation/scheduler while keeping
+	// its own construction, folding, refresh, count, and verification gates.
+	guardedCanonical           bool
+	timedEvaluatorOverride     ckks.Evaluator
+	stageOwnerOverride         func(owner int, label string, values []complex128) (paperMKFStagedOwnerCiphertext, error)
+	inputMaterializers         []func() (*ckks.Ciphertext, error)
+	timedRefreshOverride       func(*ckks.Ciphertext) (*ckks.Ciphertext, error)
+	recordCommunication        func(paperMKFCPUTrialCommunication)
+	guardedEvidence            guardedCompactP2GN16TrialEvidence
+	expectedPolynomialMulRelin int
+}
+
+func (trial *paperMKFResNet20CPUTrial) timedEvaluator() ckks.Evaluator {
+	if trial.timedEvaluatorOverride != nil {
+		return trial.timedEvaluatorOverride
+	}
+	return trial.executor.paperAdapter
+}
+
+func paperMKFEvaluationKeyWireSize(keys paperMKFCKKSOnlineKeys) (payloads int, bytes uint64, err error) {
+	addSwitchingKey := func(label string, key *rlwe.SwitchingKey) error {
+		if key == nil {
+			return fmt.Errorf("%s switching key is nil", label)
+		}
+		payloads++
+		bytes += uint64(key.GetDataLen(true))
+		return nil
+	}
+	for party, key := range keys.Fold {
+		if err := addSwitchingKey(fmt.Sprintf("fold[%d]", party), key); err != nil {
+			return 0, 0, err
+		}
+	}
+	if keys.Relin == nil || len(keys.Relin.Keys) == 0 {
+		return 0, 0, fmt.Errorf("aggregate relinearization key is absent")
+	}
+	payloads++
+	bytes += uint64(keys.Relin.GetDataLen(true))
+	for galoisElement, partyKeys := range keys.Rotations {
+		if len(partyKeys) != fullResNet20Parties {
+			return 0, 0, fmt.Errorf("rotation[%d] has %d party keys, want %d", galoisElement, len(partyKeys), fullResNet20Parties)
+		}
+		for party, key := range partyKeys {
+			if err := addSwitchingKey(fmt.Sprintf("rotation[%d][%d]", galoisElement, party), key); err != nil {
+				return 0, 0, err
+			}
+		}
+	}
+	if payloads == 0 || bytes == 0 {
+		return 0, 0, fmt.Errorf("evaluation-key wire-size coverage is empty")
+	}
+	return payloads, bytes, nil
+}
+
+func newPaperMKFResNet20CPUTrial(backend *paperMKFResNet20CPUBackend, request fullResNet20Request) (*paperMKFResNet20CPUTrial, error) {
+	executor, err := newPaperMKFPerformanceExecutor(request)
+	if err != nil {
+		return nil, err
+	}
+	trial := &paperMKFResNet20CPUTrial{
+		backend: backend, request: request, executor: executor, nextPhase: 1,
+		communication: map[resNet20CPUStage]paperMKFCPUStageCommunication{
+			resNet20CPUStem: {Stage: resNet20CPUStem}, resNet20CPUResidual: {Stage: resNet20CPUResidual}, resNet20CPUFullyConn: {Stage: resNet20CPUFullyConn},
+		},
+		recordCommunication: backend.recordCommunication,
+	}
+	trial.evaluationKeyPayloads, trial.evaluationKeyBytes, err = paperMKFEvaluationKeyWireSize(executor.paperAdapter.online.keys)
+	if err != nil {
+		return nil, fmt.Errorf("measure offline evaluation-key encoding lengths: %w", err)
+	}
+	protocol := dckks.NewRefreshProtocol(executor.params, executor.logBound, collectiveRefreshSigmaSmudging)
+	share := protocol.AllocateShare(executor.minLevel, executor.params.MaxLevel())
+	wire, err := share.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("measure fixed refresh-share encoding outside timing: %w", err)
+	}
+	trial.refreshShareSize = uint64(len(wire))
+	trial.inputCiphertexts = make([]*ckks.Ciphertext, resnetImageChannels)
+	stemCommunication := trial.communication[resNet20CPUStem]
+	for channel := 0; channel < resnetImageChannels; channel++ {
+		packed := packReplicatedInputChannel(executor.params, request.Fixture.NormalizedRGB, channel)
+		ciphertext, bytes, err := trial.encryptOwnerOutsideTiming(realResNetTailDataOwner, packed)
+		if err != nil {
+			return nil, fmt.Errorf("stage input channel %d: %w", channel, err)
+		}
+		trial.inputCiphertexts[channel] = ciphertext
+		stemCommunication.OwnerIngressCiphertexts++
+		stemCommunication.OwnerIngressBytes += bytes
+	}
+	trial.communication[resNet20CPUStem] = stemCommunication
+	return trial, nil
+}
+
+func (trial *paperMKFResNet20CPUTrial) encryptOwnerOutsideTiming(owner int, values []complex128) (*ckks.Ciphertext, uint64, error) {
+	ciphertext, err := paperMKFOwnerCarrier(trial.executor.params, trial.executor.encoder, trial.executor.public, owner, values)
+	if err != nil {
+		return nil, 0, err
+	}
+	wire, err := ciphertext.MarshalBinary()
+	if err != nil {
+		return nil, 0, fmt.Errorf("marshal staged owner ciphertext: %w", err)
+	}
+	trial.ownerCount++
+	return ciphertext, uint64(len(wire)), nil
+}
+
+func (trial *paperMKFResNet20CPUTrial) RunStem() error {
+	return fmt.Errorf("paper-MKF CPU trial is segmented; coarse RunStem is disabled")
+}
+func (trial *paperMKFResNet20CPUTrial) RunResidualBlocks() error {
+	return fmt.Errorf("paper-MKF CPU trial is segmented; coarse RunResidualBlocks is disabled")
+}
+func (trial *paperMKFResNet20CPUTrial) RunFullyConnected() error {
+	return fmt.Errorf("paper-MKF CPU trial is segmented; coarse RunFullyConnected is disabled")
+}
+
+func (trial *paperMKFResNet20CPUTrial) SegmentCount(stage resNet20CPUStage) int {
+	switch stage {
+	case resNet20CPUStem, resNet20CPUFullyConn:
+		return 1
+	case resNet20CPUResidual:
+		return 9
+	default:
+		return 0
+	}
+}
+
+func paperMKFSegmentPhaseIndex(stage resNet20CPUStage, segmentIndex int) (int, error) {
+	switch stage {
+	case resNet20CPUStem:
+		if segmentIndex == 0 {
+			return 1, nil
+		}
+	case resNet20CPUResidual:
+		if segmentIndex >= 0 && segmentIndex < 9 {
+			return 2 + segmentIndex, nil
+		}
+	case resNet20CPUFullyConn:
+		if segmentIndex == 0 {
+			return 11, nil
+		}
+	}
+	return 0, fmt.Errorf("invalid segment %s/%d", stage, segmentIndex)
+}
+
+func (trial *paperMKFResNet20CPUTrial) PrepareSegment(stage resNet20CPUStage, segmentIndex int) (resNet20CPUPreparedSegment, error) {
+	if trial.verified || trial.active != nil {
+		return nil, fmt.Errorf("paper-MKF segment preparation is out of lifecycle order")
+	}
+	phaseIndex, err := paperMKFSegmentPhaseIndex(stage, segmentIndex)
+	if err != nil {
+		return nil, err
+	}
+	if phaseIndex != trial.nextPhase {
+		return nil, fmt.Errorf("prepared phase index %d, want %d", phaseIndex, trial.nextPhase)
+	}
+	phase := trial.request.Plan.Phases[phaseIndex]
+	segment := &paperMKFResNet20CPUSegment{trial: trial, stage: stage, phase: phase}
+	segment.staged = &paperMKFStagedOwnerEvaluator{Evaluator: trial.timedEvaluator()}
+	switch phase.Kind {
+	case fullResNet20StemPhase:
+		err = trial.prepareStemSegment(segment)
+	case fullResNet20RegularPhase:
+		err = trial.prepareRegularSegment(segment)
+	case fullResNet20TransitionPhase:
+		err = trial.prepareTransitionSegment(segment)
+	case fullResNet20TailPhase:
+		err = trial.prepareTailSegment(segment)
+	default:
+		err = fmt.Errorf("unsupported timed phase kind %q", phase.Kind)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("prepare %s outside timing: %w", phase.Name, err)
+	}
+	if trial.guardedCanonical {
+		for _, site := range phase.ActivationSites {
+			polynomial := referenceResNetBlockReLUPolynomial(site.Scale)
+			if polynomial.Degree() != resnetReferenceReLUDegree || polynomial.Basis != ckks.ChebyshevBasis {
+				return nil, fmt.Errorf("audit %s degree-59 polynomial identity drifted", phase.Name)
+			}
+			count, countErr := kklssCarrierBSGSProductCount(polynomial)
+			if countErr != nil || count != p2gn16Degree59ProductsPerActivation {
+				return nil, fmt.Errorf("audit %s BSGS product schedule=%d: %w", phase.Name, count, countErr)
+			}
+			trial.expectedPolynomialMulRelin += count
+		}
+	}
+	wantOwners := phase.Expected.ModelWeightCiphertexts + phase.Expected.ModelBiasCiphertexts
+	if len(segment.staged.entries) != wantOwners {
+		return nil, fmt.Errorf("%s staged %d model ciphertexts, want %d", phase.Name, len(segment.staged.entries), wantOwners)
+	}
+	communication := trial.communication[stage]
+	communication.OwnerIngressCiphertexts += len(segment.staged.entries)
+	for _, entry := range segment.staged.entries {
+		communication.OwnerIngressBytes += entry.wireBytes
+	}
+	communication.RefreshRounds += phase.Expected.CollectiveRefreshes
+	communication.RefreshShareMessages += phase.Expected.CollectiveRefreshes * fullResNet20Parties
+	communication.RefreshShareBytes += uint64(phase.Expected.CollectiveRefreshes*fullResNet20Parties) * trial.refreshShareSize
+	trial.communication[stage] = communication
+	if trial.guardedCanonical {
+		segment.beforeGuarded = trial.executor.guardedCompactAdapter.snapshot()
+	} else {
+		segment.before = trial.executor.paperOperationSnapshot()
+		segment.beforeDecompositions = trial.executor.paperAdapter.online.profile.Decompositions
+		segment.beforeExternalPolys = trial.executor.paperAdapter.online.profile.ExternalProductPolys
+	}
+	trial.active = segment
+	return segment, nil
+}
+
+type paperMKFResNet20CPUSegment struct {
+	trial                *paperMKFResNet20CPUTrial
+	stage                resNet20CPUStage
+	phase                fullResNet20Phase
+	staged               *paperMKFStagedOwnerEvaluator
+	referenceOutput      []complex128
+	run                  func() (*ckks.Ciphertext, error)
+	before               paperMKFPhaseSnapshot
+	beforeGuarded        guardedCompactMKFCounts
+	beforeDecompositions int
+	beforeExternalPolys  int
+	output               *ckks.Ciphertext
+	ran                  bool
+	runOK                bool
+	released             bool
+}
+
+func (segment *paperMKFResNet20CPUSegment) Run() error {
+	if segment == nil || segment.trial == nil || segment.trial.active != segment || segment.ran || segment.released || segment.run == nil {
+		return fmt.Errorf("invalid paper-MKF timed segment lifecycle")
+	}
+	segment.ran = true
+	output, err := segment.run()
+	if err != nil {
+		return err
+	}
+	// Only the online homomorphic/protocol closure belongs inside Run.
+	// Release performs structural and correctness auditing after the runner
+	// has stopped the stage timer.
+	segment.output = output
+	segment.runOK = true
+	return nil
+}
+
+func (segment *paperMKFResNet20CPUSegment) Release() error {
+	if segment == nil || segment.trial == nil || segment.trial.active != segment || !segment.ran || segment.released {
+		return fmt.Errorf("invalid paper-MKF segment release order")
+	}
+	segment.released = true
+	if segment.runOK {
+		if err := segment.staged.requireConsumed(); err != nil {
+			return err
+		}
+		if segment.trial.guardedCanonical {
+			after := segment.trial.executor.guardedCompactAdapter.snapshot()
+			actual := subtractGuardedCounts(after, segment.beforeGuarded)
+			wantOwners := segment.phase.Expected.ModelWeightCiphertexts + segment.phase.Expected.ModelBiasCiphertexts
+			if segment.phase.Kind == fullResNet20StemPhase {
+				wantOwners += segment.phase.Expected.DataInputCiphertexts
+			}
+			if actual.owners != wantOwners || actual.guardedFolds != wantOwners || actual.guardRescales != wantOwners || actual.networkProducts != segment.phase.Expected.CiphertextProducts || actual.rotations != segment.phase.Expected.RotationCalls || actual.polynomials != segment.phase.Expected.Degree59Activations || actual.refreshes != segment.phase.Expected.CollectiveRefreshes {
+				return fmt.Errorf("%s canonical online count mismatch: owners/folds/rescales=%d/%d/%d want=%d products=%d/%d rotations=%d/%d poly=%d/%d refresh=%d/%d", segment.phase.Name,
+					actual.owners, actual.guardedFolds, actual.guardRescales, wantOwners,
+					actual.networkProducts, segment.phase.Expected.CiphertextProducts,
+					actual.rotations, segment.phase.Expected.RotationCalls,
+					actual.polynomials, segment.phase.Expected.Degree59Activations,
+					actual.refreshes, segment.phase.Expected.CollectiveRefreshes)
+			}
+		} else {
+			after := segment.trial.executor.paperOperationSnapshot()
+			wantMul := segment.phase.Expected.CiphertextProducts + 17*segment.phase.Expected.Degree59Activations
+			profile := segment.trial.executor.paperAdapter.online.profile
+			wantDecompositions := 5*wantMul + 2*segment.phase.Expected.RotationCalls + 2*segment.phase.Expected.CollectiveRefreshes
+			wantExternalPolys := 2 * wantDecompositions
+			actualDecompositions := profile.Decompositions - segment.beforeDecompositions
+			actualExternalPolys := profile.ExternalProductPolys - segment.beforeExternalPolys
+			if after.mulRelin-segment.before.mulRelin != wantMul || after.rotations-segment.before.rotations != segment.phase.Expected.RotationCalls || after.polynomials-segment.before.polynomials != segment.phase.Expected.Degree59Activations || after.refreshes-segment.before.refreshes != segment.phase.Expected.CollectiveRefreshes || actualDecompositions != wantDecompositions || actualExternalPolys != wantExternalPolys {
+				return fmt.Errorf("%s online count mismatch: mul=%d/%d rotations=%d/%d poly=%d/%d refresh=%d/%d decomp=%d/%d external=%d/%d", segment.phase.Name,
+					after.mulRelin-segment.before.mulRelin, wantMul,
+					after.rotations-segment.before.rotations, segment.phase.Expected.RotationCalls,
+					after.polynomials-segment.before.polynomials, segment.phase.Expected.Degree59Activations,
+					after.refreshes-segment.before.refreshes, segment.phase.Expected.CollectiveRefreshes,
+					actualDecompositions, wantDecompositions,
+					actualExternalPolys, wantExternalPolys)
+			}
+		}
+		segment.trial.current = segment.output
+		segment.trial.reference = segment.referenceOutput
+		segment.trial.nextPhase++
+	}
+	if segment.phase.Kind == fullResNet20StemPhase {
+		segment.trial.inputCiphertexts = nil
+	}
+	for index := range segment.staged.entries {
+		segment.staged.entries[index].ciphertext = nil
+	}
+	segment.staged.entries = nil
+	segment.referenceOutput = nil
+	segment.output = nil
+	segment.run = nil
+	segment.trial.active = nil
+	// This collection is deliberately outside the timed Run. It prevents
+	// ciphertexts from a released phase from accumulating into the next
+	// phase's memory footprint and cannot change any MKF operation counter.
+	runtime.GC()
+	return nil
+}
+
+func (trial *paperMKFResNet20CPUTrial) stageOwner(segment *paperMKFResNet20CPUSegment, label string, values []complex128) error {
+	if trial.stageOwnerOverride != nil {
+		entry, err := trial.stageOwnerOverride(realResNetTailModelOwner, label, values)
+		if err != nil {
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		if entry.materialize == nil || entry.wireBytes == 0 {
+			return fmt.Errorf("%s: canonical staged owner is missing materializer or wire-size evidence", label)
+		}
+		trial.ownerCount++
+		segment.staged.entries = append(segment.staged.entries, entry)
+		return nil
+	}
+	ciphertext, bytes, err := trial.encryptOwnerOutsideTiming(realResNetTailModelOwner, values)
+	if err != nil {
+		return fmt.Errorf("%s: %w", label, err)
+	}
+	segment.staged.entries = append(segment.staged.entries, paperMKFStagedOwnerCiphertext{label: label, ciphertext: ciphertext, wireBytes: bytes})
+	return nil
+}
+
+// timedRefresh has no oracle or serialization.  It is named separately so a
+// source audit can prove that only this method is reachable from segment.Run.
+func (trial *paperMKFResNet20CPUTrial) timedRefresh(input *ckks.Ciphertext) (*ckks.Ciphertext, error) {
+	if trial.timedRefreshOverride != nil {
+		return trial.timedRefreshOverride(input)
+	}
+	return trial.executor.paperAdapter.collectiveRefresh(input, trial.executor.shares, trial.executor.minLevel, trial.executor.logBound, trial.executor.refreshCRS)
+}
+
+func (trial *paperMKFResNet20CPUTrial) prepareStemSegment(segment *paperMKFResNet20CPUSegment) error {
+	phase := segment.phase
+	if len(trial.inputCiphertexts) != resnetImageChannels || len(phase.ActivationSites) != 1 {
+		return fmt.Errorf("stem input or activation contract is incomplete")
+	}
+	scale := phase.ActivationSites[0].Scale
+	weights, err := loadRealResNetStemWeightsAtScale(trial.request.WeightsDirectory, scale, trial.executor.params.Slots())
+	if err != nil {
+		return err
+	}
+	for inputChannel := 0; inputChannel < resnetImageChannels; inputChannel++ {
+		for kernelY := 0; kernelY < 3; kernelY++ {
+			for kernelX := 0; kernelX < 3; kernelX++ {
+				label := fmt.Sprintf("%s/weight/ic=%d/y=%d/x=%d", phase.Name, inputChannel, kernelY, kernelX)
+				if err := trial.stageOwner(segment, label, weights.masks[inputChannel][kernelY][kernelX]); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if err := trial.stageOwner(segment, phase.Name+"/bias", weights.biasPacked); err != nil {
+		return err
+	}
+	plain := plainRealFoldedResNetStem(trial.request.Fixture.NormalizedRGB, weights)
+	polynomial := referenceResNetBlockReLUPolynomial(scale)
+	referenceOutput, _, err := plainReferenceResNetBlockReLU(plain, polynomial, scale)
+	if err != nil {
+		return err
+	}
+	segment.referenceOutput = referenceOutput
+	segment.run = func() (*ckks.Ciphertext, error) {
+		inputs := trial.inputCiphertexts
+		if len(trial.inputMaterializers) != 0 {
+			if len(trial.inputMaterializers) != resnetImageChannels {
+				return nil, fmt.Errorf("stem has %d guarded input materializers, want %d", len(trial.inputMaterializers), resnetImageChannels)
+			}
+			inputs = make([]*ckks.Ciphertext, resnetImageChannels)
+			for channel, materialize := range trial.inputMaterializers {
+				ciphertext, err := materialize()
+				if err != nil {
+					return nil, fmt.Errorf("materialize guarded input channel %d: %w", channel, err)
+				}
+				inputs[channel] = ciphertext
+			}
+			trial.inputMaterializers = nil
+			trial.inputCiphertexts = inputs
+		}
+		conv, err := paperMKFTimedStemConv(trial.executor.params, trial.timedEvaluator(), segment.staged, inputs, phase.Name)
+		if err != nil {
+			return nil, err
+		}
+		refreshed, err := trial.timedRefresh(conv)
+		if err != nil {
+			return nil, err
+		}
+		return encryptedReferenceResNetBlockReLU(trial.timedEvaluator(), refreshed, polynomial, trial.executor.params.Scale())
+	}
+	return nil
+}
+
+func paperMKFTimedStemConv(params ckks.Parameters, evaluator ckks.Evaluator, staged *paperMKFStagedOwnerEvaluator, inputs []*ckks.Ciphertext, phaseName string) (*ckks.Ciphertext, error) {
+	var sum *ckks.Ciphertext
+	for inputChannel := 0; inputChannel < resnetImageChannels; inputChannel++ {
+		spatial := resNetBlockSpatialRotations(evaluator, inputs[inputChannel])
+		for kernelY := 0; kernelY < 3; kernelY++ {
+			for kernelX := 0; kernelX < 3; kernelX++ {
+				weight, err := staged.take(fmt.Sprintf("%s/weight/ic=%d/y=%d/x=%d", phaseName, inputChannel, kernelY, kernelX))
+				if err != nil {
+					return nil, err
+				}
+				term := evaluator.MulRelinNew(spatial[kernelY][kernelX], weight)
+				if sum == nil {
+					sum = term
+				} else {
+					evaluator.Add(sum, term, sum)
+				}
+			}
+		}
+	}
+	if err := evaluator.Rescale(sum, params.Scale(), sum); err != nil {
+		return nil, err
+	}
+	bias, err := staged.take(phaseName + "/bias")
+	if err != nil {
+		return nil, err
+	}
+	evaluator.DropLevel(bias, bias.Level()-sum.Level())
+	evaluator.Add(sum, bias, sum)
+	return sum, nil
+}
+
+func (trial *paperMKFResNet20CPUTrial) prepareRegularSegment(segment *paperMKFResNet20CPUSegment) error {
+	phase := segment.phase
+	if trial.current == nil || len(trial.reference) != trial.executor.params.Slots() || len(phase.ActivationSites) != 2 {
+		return fmt.Errorf("regular block %s has no staged input/reference", phase.Name)
+	}
+	skipReference := append([]complex128(nil), trial.reference...)
+	poly1 := referenceResNetBlockReLUPolynomial(phase.ActivationSites[0].Scale)
+	poly2 := referenceResNetBlockReLUPolynomial(phase.ActivationSites[1].Scale)
+	var runConv1, runConv2 func(*ckks.Ciphertext) (*ckks.Ciphertext, error)
+	var plainConv1, plainConv2 []complex128
+	switch phase.Layer {
+	case 1:
+		conv1, err := loadRealResNetBlockConvWeights(trial.request.WeightsDirectory, phase.Conv1Prefix, phase.ActivationSites[0].Scale, trial.executor.params.Slots())
+		if err != nil {
+			return err
+		}
+		conv2, err := loadRealResNetBlockConvWeights(trial.request.WeightsDirectory, phase.Conv2Prefix, phase.ActivationSites[1].Scale, trial.executor.params.Slots())
+		if err != nil {
+			return err
+		}
+		if err := trial.stageLayer1Weights(segment, phase.Name+"/conv1", conv1); err != nil {
+			return err
+		}
+		plainConv1 = plainRealResNetBlockConv(trial.reference, conv1)
+		activation1, _, err := plainReferenceResNetBlockReLU(plainConv1, poly1, phase.ActivationSites[0].Scale)
+		if err != nil {
+			return err
+		}
+		if err := trial.stageLayer1Weights(segment, phase.Name+"/conv2", conv2); err != nil {
+			return err
+		}
+		plainConv2 = plainRealResNetBlockConv(activation1, conv2)
+		runConv1 = func(input *ckks.Ciphertext) (*ckks.Ciphertext, error) {
+			return paperMKFTimedLayer1Conv(trial.executor.params, trial.timedEvaluator(), segment.staged, input, phase.Name+"/conv1")
+		}
+		runConv2 = func(input *ckks.Ciphertext) (*ckks.Ciphertext, error) {
+			return paperMKFTimedLayer1Conv(trial.executor.params, trial.timedEvaluator(), segment.staged, input, phase.Name+"/conv2")
+		}
+	case 2:
+		conv1, err := loadRealStage2ConvWeights(trial.request.WeightsDirectory, phase.Conv1Prefix, phase.ActivationSites[0].Scale, trial.executor.params.Slots())
+		if err != nil {
+			return err
+		}
+		conv2, err := loadRealStage2ConvWeights(trial.request.WeightsDirectory, phase.Conv2Prefix, phase.ActivationSites[1].Scale, trial.executor.params.Slots())
+		if err != nil {
+			return err
+		}
+		if err := trial.stageLayer2ConvWeights(segment, phase.Name+"/conv1", conv1); err != nil {
+			return err
+		}
+		plainConv1 = plainRealStage2Conv(trial.reference, conv1)
+		activation1, _, err := plainReferenceResNetBlockReLU(plainConv1, poly1, phase.ActivationSites[0].Scale)
+		if err != nil {
+			return err
+		}
+		if err := trial.stageLayer2ConvWeights(segment, phase.Name+"/conv2", conv2); err != nil {
+			return err
+		}
+		plainConv2 = plainRealStage2Conv(activation1, conv2)
+		runConv1 = func(input *ckks.Ciphertext) (*ckks.Ciphertext, error) {
+			return paperMKFTimedLayer2Conv(trial.executor.params, trial.timedEvaluator(), segment.staged, input, phase.Name+"/conv1")
+		}
+		runConv2 = func(input *ckks.Ciphertext) (*ckks.Ciphertext, error) {
+			return paperMKFTimedLayer2Conv(trial.executor.params, trial.timedEvaluator(), segment.staged, input, phase.Name+"/conv2")
+		}
+	case 3:
+		conv1, err := loadRealStage3SameWidthConvWeights(trial.request.WeightsDirectory, phase.Conv1Prefix, phase.ActivationSites[0].Scale, trial.executor.params.Slots())
+		if err != nil {
+			return err
+		}
+		conv2, err := loadRealStage3SameWidthConvWeights(trial.request.WeightsDirectory, phase.Conv2Prefix, phase.ActivationSites[1].Scale, trial.executor.params.Slots())
+		if err != nil {
+			return err
+		}
+		if err := trial.stageLayer3ConvWeights(segment, phase.Name+"/conv1", conv1); err != nil {
+			return err
+		}
+		plainConv1 = plainRealStage3Conv(trial.reference, conv1)
+		activation1, _, err := plainReferenceResNetBlockReLU(plainConv1, poly1, phase.ActivationSites[0].Scale)
+		if err != nil {
+			return err
+		}
+		if err := trial.stageLayer3ConvWeights(segment, phase.Name+"/conv2", conv2); err != nil {
+			return err
+		}
+		plainConv2 = plainRealStage3Conv(activation1, conv2)
+		runConv1 = func(input *ckks.Ciphertext) (*ckks.Ciphertext, error) {
+			return paperMKFTimedLayer3Conv(trial.executor.params, trial.timedEvaluator(), segment.staged, input, phase.Name+"/conv1")
+		}
+		runConv2 = func(input *ckks.Ciphertext) (*ckks.Ciphertext, error) {
+			return paperMKFTimedLayer3Conv(trial.executor.params, trial.timedEvaluator(), segment.staged, input, phase.Name+"/conv2")
+		}
+	default:
+		return fmt.Errorf("unsupported regular layer %d", phase.Layer)
+	}
+	plainResidual := addPlainRealResNetBlockSkip(plainConv2, skipReference, phase.ActivationSites[1].Scale)
+	referenceOutput, _, err := plainReferenceResNetBlockReLU(plainResidual, poly2, phase.ActivationSites[1].Scale)
+	if err != nil {
+		return err
+	}
+	segment.referenceOutput = referenceOutput
+	input := trial.current
+	segment.run = func() (*ckks.Ciphertext, error) {
+		evaluator := trial.timedEvaluator()
+		skipCiphertext := input
+		conv1, err := runConv1(input)
+		if err != nil {
+			return nil, err
+		}
+		refreshed1, err := trial.timedRefresh(conv1)
+		if err != nil {
+			return nil, err
+		}
+		activation1, err := encryptedReferenceResNetBlockReLU(evaluator, refreshed1, poly1, trial.executor.params.Scale())
+		if err != nil {
+			return nil, err
+		}
+		conv2, err := runConv2(activation1)
+		if err != nil {
+			return nil, err
+		}
+		if err := addScaledRealResNetBlockSkip(trial.executor.params, evaluator, conv2, skipCiphertext, phase.ActivationSites[1].Scale); err != nil {
+			return nil, err
+		}
+		refreshed2, err := trial.timedRefresh(conv2)
+		if err != nil {
+			return nil, err
+		}
+		output, err := encryptedReferenceResNetBlockReLU(evaluator, refreshed2, poly2, trial.executor.params.Scale())
+		if err != nil {
+			return nil, err
+		}
+		if len(phase.RequiredBoundaries) == 8 {
+			return trial.timedRefresh(output)
+		}
+		return output, nil
+	}
+	return nil
+}
+
+func (trial *paperMKFResNet20CPUTrial) stageLayer1Weights(segment *paperMKFResNet20CPUSegment, prefix string, weights *realResNetBlockConvWeights) error {
+	for diagonal := 0; diagonal < realResNetBlockChannels; diagonal++ {
+		for kernelY := 0; kernelY < 3; kernelY++ {
+			for kernelX := 0; kernelX < 3; kernelX++ {
+				if err := trial.stageOwner(segment, fmt.Sprintf("%s/d=%d/y=%d/x=%d", prefix, diagonal, kernelY, kernelX), weights.masks[diagonal][kernelY][kernelX]); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return trial.stageOwner(segment, prefix+"/bias", weights.packedBias)
+}
+
+func (trial *paperMKFResNet20CPUTrial) stageLayer2ConvWeights(segment *paperMKFResNet20CPUSegment, prefix string, weights *realStage2ConvWeights) error {
+	for diagonal := 0; diagonal < realStage2OutputChannels; diagonal++ {
+		for kernelY := 0; kernelY < 3; kernelY++ {
+			for kernelX := 0; kernelX < 3; kernelX++ {
+				if err := trial.stageOwner(segment, fmt.Sprintf("%s/d=%d/y=%d/x=%d", prefix, diagonal, kernelY, kernelX), weights.masks[diagonal][kernelY][kernelX]); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return trial.stageOwner(segment, prefix+"/bias", weights.packedBias)
+}
+
+func (trial *paperMKFResNet20CPUTrial) stageLayer3ConvWeights(segment *paperMKFResNet20CPUSegment, prefix string, weights *realStage3ConvWeights) error {
+	for diagonal := 0; diagonal < realStage3OutputChannels; diagonal++ {
+		for kernelY := 0; kernelY < 3; kernelY++ {
+			for kernelX := 0; kernelX < 3; kernelX++ {
+				if err := trial.stageOwner(segment, fmt.Sprintf("%s/d=%d/y=%d/x=%d", prefix, diagonal, kernelY, kernelX), weights.masks[diagonal][kernelY][kernelX]); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return trial.stageOwner(segment, prefix+"/bias", weights.packedBias)
+}
+
+func paperMKFTimedLayer1Conv(params ckks.Parameters, evaluator ckks.Evaluator, staged *paperMKFStagedOwnerEvaluator, input *ckks.Ciphertext, prefix string) (*ckks.Ciphertext, error) {
+	var sum *ckks.Ciphertext
+	for diagonal := 0; diagonal < realResNetBlockChannels; diagonal++ {
+		channelShifted := input
+		if diagonal != 0 {
+			channelShifted = evaluator.RotateNew(input, diagonal*resnetChannelSlotSize)
+		}
+		spatial := resNetBlockSpatialRotations(evaluator, channelShifted)
+		for kernelY := 0; kernelY < 3; kernelY++ {
+			for kernelX := 0; kernelX < 3; kernelX++ {
+				weight, err := staged.take(fmt.Sprintf("%s/d=%d/y=%d/x=%d", prefix, diagonal, kernelY, kernelX))
+				if err != nil {
+					return nil, err
+				}
+				term := evaluator.MulRelinNew(spatial[kernelY][kernelX], weight)
+				if sum == nil {
+					sum = term
+				} else {
+					evaluator.Add(sum, term, sum)
+				}
+			}
+		}
+	}
+	if err := evaluator.Rescale(sum, params.Scale(), sum); err != nil {
+		return nil, err
+	}
+	bias, err := staged.take(prefix + "/bias")
+	if err != nil {
+		return nil, err
+	}
+	evaluator.DropLevel(bias, bias.Level()-sum.Level())
+	evaluator.Add(sum, bias, sum)
+	return sum, nil
+}
+
+func paperMKFTimedLayer2Conv(params ckks.Parameters, evaluator ckks.Evaluator, staged *paperMKFStagedOwnerEvaluator, input *ckks.Ciphertext, prefix string) (*ckks.Ciphertext, error) {
+	var sum *ckks.Ciphertext
+	for diagonal := 0; diagonal < realStage2OutputChannels; diagonal++ {
+		channelShifted := input
+		if diagonal != 0 {
+			channelShifted = evaluator.RotateNew(input, diagonal*realStage2OutputBlock)
+		}
+		spatial := stage2SpatialRotations(evaluator, channelShifted)
+		for kernelY := 0; kernelY < 3; kernelY++ {
+			for kernelX := 0; kernelX < 3; kernelX++ {
+				weight, err := staged.take(fmt.Sprintf("%s/d=%d/y=%d/x=%d", prefix, diagonal, kernelY, kernelX))
+				if err != nil {
+					return nil, err
+				}
+				term := evaluator.MulRelinNew(spatial[kernelY][kernelX], weight)
+				if sum == nil {
+					sum = term
+				} else {
+					evaluator.Add(sum, term, sum)
+				}
+			}
+		}
+	}
+	if err := evaluator.Rescale(sum, params.Scale(), sum); err != nil {
+		return nil, err
+	}
+	bias, err := staged.take(prefix + "/bias")
+	if err != nil {
+		return nil, err
+	}
+	evaluator.DropLevel(bias, bias.Level()-sum.Level())
+	evaluator.Add(sum, bias, sum)
+	return sum, nil
+}
+
+func paperMKFTimedLayer3Conv(params ckks.Parameters, evaluator ckks.Evaluator, staged *paperMKFStagedOwnerEvaluator, input *ckks.Ciphertext, prefix string) (*ckks.Ciphertext, error) {
+	var sum *ckks.Ciphertext
+	for diagonal := 0; diagonal < realStage3OutputChannels; diagonal++ {
+		channelShifted := input
+		if diagonal != 0 {
+			channelShifted = evaluator.RotateNew(input, diagonal*realStage3OutputBlock)
+		}
+		spatial := stage3SpatialRotations(evaluator, channelShifted)
+		for kernelY := 0; kernelY < 3; kernelY++ {
+			for kernelX := 0; kernelX < 3; kernelX++ {
+				weight, err := staged.take(fmt.Sprintf("%s/d=%d/y=%d/x=%d", prefix, diagonal, kernelY, kernelX))
+				if err != nil {
+					return nil, err
+				}
+				term := evaluator.MulRelinNew(spatial[kernelY][kernelX], weight)
+				if sum == nil {
+					sum = term
+				} else {
+					evaluator.Add(sum, term, sum)
+				}
+			}
+		}
+	}
+	if err := evaluator.Rescale(sum, params.Scale(), sum); err != nil {
+		return nil, err
+	}
+	bias, err := staged.take(prefix + "/bias")
+	if err != nil {
+		return nil, err
+	}
+	evaluator.DropLevel(bias, bias.Level()-sum.Level())
+	evaluator.Add(sum, bias, sum)
+	return sum, nil
+}
+
+type paperMKFStage2PackingMaterial struct {
+	level       int
+	alternating map[int]*ckks.Plaintext
+	rows        []*ckks.Plaintext
+	channels    []*ckks.Plaintext
+}
+
+func newPaperMKFStage2PackingMaterial(params ckks.Parameters, encoder ckks.Encoder, level int) *paperMKFStage2PackingMaterial {
+	material := &paperMKFStage2PackingMaterial{level: level, alternating: make(map[int]*ckks.Plaintext), rows: make([]*ckks.Plaintext, realStage2OutputWidth), channels: make([]*ckks.Plaintext, realStage2InputChannels)}
+	for _, keep := range []int{2, 4, 8} {
+		material.alternating[keep] = stage2EncodeUnitMask(params, encoder, level, stage2AlternatingMask(params.Slots(), keep))
+	}
+	for row := range material.rows {
+		material.rows[row] = stage2EncodeUnitMask(params, encoder, level, stage2RowMask(params.Slots(), row))
+	}
+	for channel := range material.channels {
+		material.channels[channel] = stage2EncodeUnitMask(params, encoder, level, stage2ChannelMask(params.Slots(), channel))
+	}
+	return material
+}
+
+func paperMKFStage2Mask(evaluator ckks.Evaluator, input *ckks.Ciphertext, plaintext *ckks.Plaintext, level int) (*ckks.Ciphertext, error) {
+	if input.Level() != level || plaintext.Level() != level {
+		return nil, fmt.Errorf("stage2 pre-encoded mask level mismatch input=%d plaintext=%d want=%d", input.Level(), plaintext.Level(), level)
+	}
+	return evaluator.MulNew(input, plaintext), nil
+}
+
+func paperMKFTimedCompactStage2Half(evaluator ckks.Evaluator, input *ckks.Ciphertext, material *paperMKFStage2PackingMaterial) (*ckks.Ciphertext, error) {
+	current := input.CopyNew()
+	for _, step := range []struct{ rotation, keep int }{{1, 2}, {2, 4}, {4, 8}} {
+		current = evaluator.AddNew(current, evaluator.RotateNew(current, step.rotation))
+		var err error
+		current, err = paperMKFStage2Mask(evaluator, current, material.alternating[step.keep], material.level)
+		if err != nil {
+			return nil, err
+		}
+	}
+	current = evaluator.AddNew(current, evaluator.RotateNew(current, 8))
+	var rows *ckks.Ciphertext
+	for row := 0; row < realStage2OutputWidth; row++ {
+		rowWork := current
+		if row != 0 {
+			rowWork = evaluator.RotateNew(current, row*(realStage2InputWidth+realStage2OutputWidth))
+		}
+		masked, err := paperMKFStage2Mask(evaluator, rowWork, material.rows[row], material.level)
+		if err != nil {
+			return nil, err
+		}
+		if rows == nil {
+			rows = masked
+		} else {
+			evaluator.Add(rows, masked, rows)
+		}
+	}
+	var channels *ckks.Ciphertext
+	for channel := 0; channel < realStage2InputChannels; channel++ {
+		masked, err := paperMKFStage2Mask(evaluator, rows, material.channels[channel], material.level)
+		if err != nil {
+			return nil, err
+		}
+		if channel != 0 {
+			masked = evaluator.RotateNew(masked, channel*(realStage2InputBlock-realStage2OutputBlock))
+		}
+		if channels == nil {
+			channels = masked
+		} else {
+			evaluator.Add(channels, masked, channels)
+		}
+	}
+	return channels, nil
+}
+
+func paperMKFTimedPackStage2Halves(evaluator ckks.Evaluator, first, second *ckks.Ciphertext, material *paperMKFStage2PackingMaterial) (*ckks.Ciphertext, error) {
+	firstCompact, err := paperMKFTimedCompactStage2Half(evaluator, first, material)
+	if err != nil {
+		return nil, err
+	}
+	secondCompact, err := paperMKFTimedCompactStage2Half(evaluator, second, material)
+	if err != nil {
+		return nil, err
+	}
+	secondCompact = evaluator.RotateNew(secondCompact, -realStage2LogicalSlots/2)
+	packed := evaluator.AddNew(firstCompact, secondCompact)
+	return evaluator.AddNew(packed, evaluator.RotateNew(packed, -realStage2LogicalSlots)), nil
+}
+
+type paperMKFStage3PackingMaterial struct {
+	level       int
+	half        [2]*ckks.Plaintext
+	alternating map[int]*ckks.Plaintext
+	rows        []*ckks.Plaintext
+	channels    []*ckks.Plaintext
+}
+
+func newPaperMKFStage3PackingMaterial(params ckks.Parameters, encoder ckks.Encoder, level int) *paperMKFStage3PackingMaterial {
+	material := &paperMKFStage3PackingMaterial{level: level, alternating: make(map[int]*ckks.Plaintext), rows: make([]*ckks.Plaintext, 2*realStage3InputWidth), channels: make([]*ckks.Plaintext, realStage3OutputChannels)}
+	material.half[0] = stage3EncodeUnitMask(params, encoder, level, stage3HalfMask(params.Slots(), false))
+	material.half[1] = stage3EncodeUnitMask(params, encoder, level, stage3HalfMask(params.Slots(), true))
+	for _, keep := range []int{2, 4} {
+		material.alternating[keep] = stage3EncodeUnitMask(params, encoder, level, stage3AlternatingMask(params.Slots(), keep))
+	}
+	for row := range material.rows {
+		material.rows[row] = stage3EncodeUnitMask(params, encoder, level, stage3RowMask(params.Slots(), row))
+	}
+	for channel := range material.channels {
+		material.channels[channel] = stage3EncodeUnitMask(params, encoder, level, stage3ChannelMask(params.Slots(), channel))
+	}
+	return material
+}
+
+func paperMKFStage3Mask(evaluator ckks.Evaluator, input *ckks.Ciphertext, plaintext *ckks.Plaintext, level int) (*ckks.Ciphertext, error) {
+	if input.Level() != level || plaintext.Level() != level {
+		return nil, fmt.Errorf("stage3 pre-encoded mask level mismatch input=%d plaintext=%d want=%d", input.Level(), plaintext.Level(), level)
+	}
+	return evaluator.MulNew(input, plaintext), nil
+}
+
+func paperMKFTimedPackStage3Halves(evaluator ckks.Evaluator, first, second *ckks.Ciphertext, material *paperMKFStage3PackingMaterial) (*ckks.Ciphertext, error) {
+	firstSelected, err := paperMKFStage3Mask(evaluator, first, material.half[0], material.level)
+	if err != nil {
+		return nil, err
+	}
+	secondSelected, err := paperMKFStage3Mask(evaluator, second, material.half[1], material.level)
+	if err != nil {
+		return nil, err
+	}
+	current := evaluator.AddNew(firstSelected, secondSelected)
+	for _, step := range []struct{ rotation, keep int }{{1, 2}, {2, 4}} {
+		current = evaluator.AddNew(current, evaluator.RotateNew(current, step.rotation))
+		current, err = paperMKFStage3Mask(evaluator, current, material.alternating[step.keep], material.level)
+		if err != nil {
+			return nil, err
+		}
+	}
+	current = evaluator.AddNew(current, evaluator.RotateNew(current, 4))
+	var rows *ckks.Ciphertext
+	for row := 0; row < 2*realStage3InputWidth; row++ {
+		rowWork := current
+		if row != 0 {
+			rowWork = evaluator.RotateNew(current, row*(realStage3InputWidth+realStage3OutputWidth))
+		}
+		masked, err := paperMKFStage3Mask(evaluator, rowWork, material.rows[row], material.level)
+		if err != nil {
+			return nil, err
+		}
+		if rows == nil {
+			rows = masked
+		} else {
+			evaluator.Add(rows, masked, rows)
+		}
+	}
+	var channels *ckks.Ciphertext
+	for channel := 0; channel < realStage3OutputChannels; channel++ {
+		masked, err := paperMKFStage3Mask(evaluator, rows, material.channels[channel], material.level)
+		if err != nil {
+			return nil, err
+		}
+		if channel != 0 {
+			masked = evaluator.RotateNew(masked, channel*(realStage3InputBlock-realStage3OutputBlock))
+		}
+		if channels == nil {
+			channels = masked
+		} else {
+			evaluator.Add(channels, masked, channels)
+		}
+	}
+	channels = evaluator.AddNew(channels, evaluator.RotateNew(channels, -realStage3LogicalSlots))
+	return evaluator.AddNew(channels, evaluator.RotateNew(channels, -2*realStage3LogicalSlots)), nil
+}
+
+func (trial *paperMKFResNet20CPUTrial) prepareTransitionSegment(segment *paperMKFResNet20CPUSegment) error {
+	if trial.current == nil || len(trial.reference) != trial.executor.params.Slots() || len(segment.phase.ActivationSites) != 2 {
+		return fmt.Errorf("transition block %s has no staged input/reference", segment.phase.Name)
+	}
+	if segment.phase.Layer == 2 {
+		return trial.prepareStage2TransitionSegment(segment)
+	}
+	if segment.phase.Layer == 3 {
+		return trial.prepareStage3TransitionSegment(segment)
+	}
+	return fmt.Errorf("unsupported transition layer %d", segment.phase.Layer)
+}
+
+func (trial *paperMKFResNet20CPUTrial) prepareStage2TransitionSegment(segment *paperMKFResNet20CPUSegment) error {
+	phase := segment.phase
+	mainWeights, err := loadRealStage2StrideWeights(trial.request.WeightsDirectory, phase.ActivationSites[0].Scale, trial.executor.params.Slots())
+	if err != nil {
+		return err
+	}
+	skipWeights, err := loadRealStage2SkipWeights(trial.request.WeightsDirectory, phase.ActivationSites[1].Scale, trial.executor.params.Slots())
+	if err != nil {
+		return err
+	}
+	conv2Weights, err := loadRealStage2ConvWeights(trial.request.WeightsDirectory, phase.Conv2Prefix, phase.ActivationSites[1].Scale, trial.executor.params.Slots())
+	if err != nil {
+		return err
+	}
+	if err := trial.stageStage2StrideWeights(segment, phase.Name+"/main", mainWeights); err != nil {
+		return err
+	}
+	if err := trial.stageStage2SkipWeights(segment, phase.Name+"/skip", skipWeights); err != nil {
+		return err
+	}
+	if err := trial.stageLayer2ConvWeights(segment, phase.Name+"/conv2", conv2Weights); err != nil {
+		return err
+	}
+	plainMain := plainRealStage2StrideConv(trial.reference, mainWeights)
+	plainSkip := plainRealStage2Skip(trial.reference, skipWeights)
+	poly1 := referenceResNetBlockReLUPolynomial(phase.ActivationSites[0].Scale)
+	plainActivation1, _, err := plainReferenceResNetBlockReLU(plainMain, poly1, phase.ActivationSites[0].Scale)
+	if err != nil {
+		return err
+	}
+	plainConv2 := plainRealStage2Conv(plainActivation1, conv2Weights)
+	plainResidual := stage2AddPlainBranches(plainConv2, plainSkip)
+	poly2 := referenceResNetBlockReLUPolynomial(phase.ActivationSites[1].Scale)
+	segment.referenceOutput, _, err = plainReferenceResNetBlockReLU(plainResidual, poly2, phase.ActivationSites[1].Scale)
+	if err != nil {
+		return err
+	}
+	packing := newPaperMKFStage2PackingMaterial(trial.executor.params, trial.executor.encoder, trial.executor.params.MaxLevel()-1)
+	input := trial.current
+	segment.run = func() (*ckks.Ciphertext, error) {
+		evaluator := trial.timedEvaluator()
+		refreshedInput, err := trial.timedRefresh(input)
+		if err != nil {
+			return nil, err
+		}
+		mainHalves, err := paperMKFTimedStage2StrideConv(trial.executor.params, evaluator, segment.staged, refreshedInput, phase.Name+"/main")
+		if err != nil {
+			return nil, err
+		}
+		skipHalves, err := paperMKFTimedStage2Skip(trial.executor.params, evaluator, segment.staged, refreshedInput, phase.Name+"/skip")
+		if err != nil {
+			return nil, err
+		}
+		packedMain, err := paperMKFTimedPackStage2Halves(evaluator, mainHalves[0], mainHalves[1], packing)
+		if err != nil {
+			return nil, err
+		}
+		packedSkip, err := paperMKFTimedPackStage2Halves(evaluator, skipHalves[0], skipHalves[1], packing)
+		if err != nil {
+			return nil, err
+		}
+		if err := evaluator.Rescale(packedMain, trial.executor.params.Scale(), packedMain); err != nil {
+			return nil, err
+		}
+		if err := evaluator.Rescale(packedSkip, trial.executor.params.Scale(), packedSkip); err != nil {
+			return nil, err
+		}
+		refreshedMain, err := trial.timedRefresh(packedMain)
+		if err != nil {
+			return nil, err
+		}
+		activation1, err := encryptedReferenceResNetBlockReLU(evaluator, refreshedMain, poly1, trial.executor.params.Scale())
+		if err != nil {
+			return nil, err
+		}
+		conv2, err := paperMKFTimedLayer2Conv(trial.executor.params, evaluator, segment.staged, activation1, phase.Name+"/conv2")
+		if err != nil {
+			return nil, err
+		}
+		if packedSkip.Level() < conv2.Level() {
+			return nil, fmt.Errorf("stage2 skip level %d below conv2 %d", packedSkip.Level(), conv2.Level())
+		}
+		evaluator.DropLevel(packedSkip, packedSkip.Level()-conv2.Level())
+		evaluator.Add(conv2, packedSkip, conv2)
+		refreshedResidual, err := trial.timedRefresh(conv2)
+		if err != nil {
+			return nil, err
+		}
+		return encryptedReferenceResNetBlockReLU(evaluator, refreshedResidual, poly2, trial.executor.params.Scale())
+	}
+	return nil
+}
+
+func (trial *paperMKFResNet20CPUTrial) stageStage2StrideWeights(segment *paperMKFResNet20CPUSegment, prefix string, weights *realStage2StrideWeights) error {
+	for group := 0; group < 2; group++ {
+		for diagonal := 0; diagonal < realStage2InputChannels; diagonal++ {
+			for kernelY := 0; kernelY < 3; kernelY++ {
+				for kernelX := 0; kernelX < 3; kernelX++ {
+					if err := trial.stageOwner(segment, fmt.Sprintf("%s/g=%d/d=%d/y=%d/x=%d", prefix, group, diagonal, kernelY, kernelX), weights.masks[group][diagonal][kernelY][kernelX]); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if err := trial.stageOwner(segment, fmt.Sprintf("%s/g=%d/bias", prefix, group), weights.packedBias[group]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (trial *paperMKFResNet20CPUTrial) stageStage2SkipWeights(segment *paperMKFResNet20CPUSegment, prefix string, weights *realStage2SkipWeights) error {
+	for group := 0; group < 2; group++ {
+		for diagonal := 0; diagonal < realStage2InputChannels; diagonal++ {
+			if err := trial.stageOwner(segment, fmt.Sprintf("%s/g=%d/d=%d", prefix, group, diagonal), weights.masks[group][diagonal]); err != nil {
+				return err
+			}
+		}
+		if err := trial.stageOwner(segment, fmt.Sprintf("%s/g=%d/bias", prefix, group), weights.packedBias[group]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func paperMKFTimedStage2StrideConv(params ckks.Parameters, evaluator ckks.Evaluator, staged *paperMKFStagedOwnerEvaluator, input *ckks.Ciphertext, prefix string) ([2]*ckks.Ciphertext, error) {
+	var output [2]*ckks.Ciphertext
+	for group := 0; group < 2; group++ {
+		var sum *ckks.Ciphertext
+		for diagonal := 0; diagonal < realStage2InputChannels; diagonal++ {
+			channelShifted := input
+			if diagonal != 0 {
+				channelShifted = evaluator.RotateNew(input, diagonal*realStage2InputBlock)
+			}
+			spatial := resNetBlockSpatialRotations(evaluator, channelShifted)
+			for kernelY := 0; kernelY < 3; kernelY++ {
+				for kernelX := 0; kernelX < 3; kernelX++ {
+					weight, err := staged.take(fmt.Sprintf("%s/g=%d/d=%d/y=%d/x=%d", prefix, group, diagonal, kernelY, kernelX))
+					if err != nil {
+						return output, err
+					}
+					term := evaluator.MulRelinNew(spatial[kernelY][kernelX], weight)
+					if sum == nil {
+						sum = term
+					} else {
+						evaluator.Add(sum, term, sum)
+					}
+				}
+			}
+		}
+		if err := evaluator.Rescale(sum, params.Scale(), sum); err != nil {
+			return output, err
+		}
+		bias, err := staged.take(fmt.Sprintf("%s/g=%d/bias", prefix, group))
+		if err != nil {
+			return output, err
+		}
+		evaluator.DropLevel(bias, bias.Level()-sum.Level())
+		evaluator.Add(sum, bias, sum)
+		output[group] = sum
+	}
+	return output, nil
+}
+
+func paperMKFTimedStage2Skip(params ckks.Parameters, evaluator ckks.Evaluator, staged *paperMKFStagedOwnerEvaluator, input *ckks.Ciphertext, prefix string) ([2]*ckks.Ciphertext, error) {
+	var output [2]*ckks.Ciphertext
+	for group := 0; group < 2; group++ {
+		var sum *ckks.Ciphertext
+		for diagonal := 0; diagonal < realStage2InputChannels; diagonal++ {
+			channelShifted := input
+			if diagonal != 0 {
+				channelShifted = evaluator.RotateNew(input, diagonal*realStage2InputBlock)
+			}
+			weight, err := staged.take(fmt.Sprintf("%s/g=%d/d=%d", prefix, group, diagonal))
+			if err != nil {
+				return output, err
+			}
+			term := evaluator.MulRelinNew(channelShifted, weight)
+			if sum == nil {
+				sum = term
+			} else {
+				evaluator.Add(sum, term, sum)
+			}
+		}
+		if err := evaluator.Rescale(sum, params.Scale(), sum); err != nil {
+			return output, err
+		}
+		bias, err := staged.take(fmt.Sprintf("%s/g=%d/bias", prefix, group))
+		if err != nil {
+			return output, err
+		}
+		evaluator.DropLevel(bias, bias.Level()-sum.Level())
+		evaluator.Add(sum, bias, sum)
+		output[group] = sum
+	}
+	return output, nil
+}
+
+func (trial *paperMKFResNet20CPUTrial) prepareStage3TransitionSegment(segment *paperMKFResNet20CPUSegment) error {
+	phase := segment.phase
+	mainWeights, err := loadRealStage3StrideWeights(trial.request.WeightsDirectory, phase.ActivationSites[0].Scale, trial.executor.params.Slots())
+	if err != nil {
+		return err
+	}
+	skipWeights, err := loadRealStage3SkipWeights(trial.request.WeightsDirectory, phase.ActivationSites[1].Scale, trial.executor.params.Slots())
+	if err != nil {
+		return err
+	}
+	conv2Weights, err := loadRealStage3ConvWeights(trial.request.WeightsDirectory, phase.ActivationSites[1].Scale, trial.executor.params.Slots())
+	if err != nil {
+		return err
+	}
+	if err := trial.stageStage3StrideWeights(segment, phase.Name+"/main", mainWeights); err != nil {
+		return err
+	}
+	if err := trial.stageStage3SkipWeights(segment, phase.Name+"/skip", skipWeights); err != nil {
+		return err
+	}
+	if err := trial.stageLayer3ConvWeights(segment, phase.Name+"/conv2", conv2Weights); err != nil {
+		return err
+	}
+	plainMain := plainRealStage3StrideConv(trial.reference, mainWeights)
+	plainSkip := plainRealStage3Skip(trial.reference, skipWeights)
+	poly1 := referenceResNetBlockReLUPolynomial(phase.ActivationSites[0].Scale)
+	plainActivation1, _, err := plainReferenceResNetBlockReLU(plainMain, poly1, phase.ActivationSites[0].Scale)
+	if err != nil {
+		return err
+	}
+	plainConv2 := plainRealStage3Conv(plainActivation1, conv2Weights)
+	plainResidual := stage3AddPlainBranches(plainConv2, plainSkip)
+	poly2 := referenceResNetBlockReLUPolynomial(phase.ActivationSites[1].Scale)
+	segment.referenceOutput, _, err = plainReferenceResNetBlockReLU(plainResidual, poly2, phase.ActivationSites[1].Scale)
+	if err != nil {
+		return err
+	}
+	packing := newPaperMKFStage3PackingMaterial(trial.executor.params, trial.executor.encoder, trial.executor.params.MaxLevel()-1)
+	input := trial.current
+	segment.run = func() (*ckks.Ciphertext, error) {
+		evaluator := trial.timedEvaluator()
+		refreshedInput, err := trial.timedRefresh(input)
+		if err != nil {
+			return nil, err
+		}
+		mainHalves, err := paperMKFTimedStage3StrideConv(trial.executor.params, evaluator, segment.staged, refreshedInput, phase.Name+"/main")
+		if err != nil {
+			return nil, err
+		}
+		skipHalves, err := paperMKFTimedStage3Skip(trial.executor.params, evaluator, segment.staged, refreshedInput, phase.Name+"/skip")
+		if err != nil {
+			return nil, err
+		}
+		packedMain, err := paperMKFTimedPackStage3Halves(evaluator, mainHalves[0], mainHalves[1], packing)
+		if err != nil {
+			return nil, err
+		}
+		packedSkip, err := paperMKFTimedPackStage3Halves(evaluator, skipHalves[0], skipHalves[1], packing)
+		if err != nil {
+			return nil, err
+		}
+		if err := evaluator.Rescale(packedMain, trial.executor.params.Scale(), packedMain); err != nil {
+			return nil, err
+		}
+		if err := evaluator.Rescale(packedSkip, trial.executor.params.Scale(), packedSkip); err != nil {
+			return nil, err
+		}
+		refreshedMain, err := trial.timedRefresh(packedMain)
+		if err != nil {
+			return nil, err
+		}
+		activation1, err := encryptedReferenceResNetBlockReLU(evaluator, refreshedMain, poly1, trial.executor.params.Scale())
+		if err != nil {
+			return nil, err
+		}
+		conv2, err := paperMKFTimedLayer3Conv(trial.executor.params, evaluator, segment.staged, activation1, phase.Name+"/conv2")
+		if err != nil {
+			return nil, err
+		}
+		if packedSkip.Level() < conv2.Level() {
+			return nil, fmt.Errorf("stage3 skip level %d below conv2 %d", packedSkip.Level(), conv2.Level())
+		}
+		evaluator.DropLevel(packedSkip, packedSkip.Level()-conv2.Level())
+		evaluator.Add(conv2, packedSkip, conv2)
+		refreshedResidual, err := trial.timedRefresh(conv2)
+		if err != nil {
+			return nil, err
+		}
+		return encryptedReferenceResNetBlockReLU(evaluator, refreshedResidual, poly2, trial.executor.params.Scale())
+	}
+	return nil
+}
+
+func (trial *paperMKFResNet20CPUTrial) stageStage3StrideWeights(segment *paperMKFResNet20CPUSegment, prefix string, weights *realStage3StrideWeights) error {
+	for group := 0; group < 2; group++ {
+		for diagonal := 0; diagonal < realStage3InputChannels; diagonal++ {
+			for kernelY := 0; kernelY < 3; kernelY++ {
+				for kernelX := 0; kernelX < 3; kernelX++ {
+					if err := trial.stageOwner(segment, fmt.Sprintf("%s/g=%d/d=%d/y=%d/x=%d", prefix, group, diagonal, kernelY, kernelX), weights.masks[group][diagonal][kernelY][kernelX]); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if err := trial.stageOwner(segment, fmt.Sprintf("%s/g=%d/bias", prefix, group), weights.packedBias[group]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (trial *paperMKFResNet20CPUTrial) stageStage3SkipWeights(segment *paperMKFResNet20CPUSegment, prefix string, weights *realStage3SkipWeights) error {
+	for group := 0; group < 2; group++ {
+		for diagonal := 0; diagonal < realStage3InputChannels; diagonal++ {
+			if err := trial.stageOwner(segment, fmt.Sprintf("%s/g=%d/d=%d", prefix, group, diagonal), weights.masks[group][diagonal]); err != nil {
+				return err
+			}
+		}
+		if err := trial.stageOwner(segment, fmt.Sprintf("%s/g=%d/bias", prefix, group), weights.packedBias[group]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func paperMKFTimedStage3StrideConv(params ckks.Parameters, evaluator ckks.Evaluator, staged *paperMKFStagedOwnerEvaluator, input *ckks.Ciphertext, prefix string) ([2]*ckks.Ciphertext, error) {
+	var output [2]*ckks.Ciphertext
+	for group := 0; group < 2; group++ {
+		var sum *ckks.Ciphertext
+		for diagonal := 0; diagonal < realStage3InputChannels; diagonal++ {
+			channelShifted := input
+			if diagonal != 0 {
+				channelShifted = evaluator.RotateNew(input, diagonal*realStage3InputBlock)
+			}
+			spatial := stage3InputSpatialRotations(evaluator, channelShifted)
+			for kernelY := 0; kernelY < 3; kernelY++ {
+				for kernelX := 0; kernelX < 3; kernelX++ {
+					weight, err := staged.take(fmt.Sprintf("%s/g=%d/d=%d/y=%d/x=%d", prefix, group, diagonal, kernelY, kernelX))
+					if err != nil {
+						return output, err
+					}
+					term := evaluator.MulRelinNew(spatial[kernelY][kernelX], weight)
+					if sum == nil {
+						sum = term
+					} else {
+						evaluator.Add(sum, term, sum)
+					}
+				}
+			}
+		}
+		if err := evaluator.Rescale(sum, params.Scale(), sum); err != nil {
+			return output, err
+		}
+		bias, err := staged.take(fmt.Sprintf("%s/g=%d/bias", prefix, group))
+		if err != nil {
+			return output, err
+		}
+		evaluator.DropLevel(bias, bias.Level()-sum.Level())
+		evaluator.Add(sum, bias, sum)
+		output[group] = sum
+	}
+	return output, nil
+}
+
+func paperMKFTimedStage3Skip(params ckks.Parameters, evaluator ckks.Evaluator, staged *paperMKFStagedOwnerEvaluator, input *ckks.Ciphertext, prefix string) ([2]*ckks.Ciphertext, error) {
+	var output [2]*ckks.Ciphertext
+	for group := 0; group < 2; group++ {
+		var sum *ckks.Ciphertext
+		for diagonal := 0; diagonal < realStage3InputChannels; diagonal++ {
+			channelShifted := input
+			if diagonal != 0 {
+				channelShifted = evaluator.RotateNew(input, diagonal*realStage3InputBlock)
+			}
+			weight, err := staged.take(fmt.Sprintf("%s/g=%d/d=%d", prefix, group, diagonal))
+			if err != nil {
+				return output, err
+			}
+			term := evaluator.MulRelinNew(channelShifted, weight)
+			if sum == nil {
+				sum = term
+			} else {
+				evaluator.Add(sum, term, sum)
+			}
+		}
+		if err := evaluator.Rescale(sum, params.Scale(), sum); err != nil {
+			return output, err
+		}
+		bias, err := staged.take(fmt.Sprintf("%s/g=%d/bias", prefix, group))
+		if err != nil {
+			return output, err
+		}
+		evaluator.DropLevel(bias, bias.Level()-sum.Level())
+		evaluator.Add(sum, bias, sum)
+		output[group] = sum
+	}
+	return output, nil
+}
+
+func (trial *paperMKFResNet20CPUTrial) prepareTailSegment(segment *paperMKFResNet20CPUSegment) error {
+	if trial.current == nil || len(trial.reference) != trial.executor.params.Slots() {
+		return fmt.Errorf("tail has no staged input/reference")
+	}
+	weights, err := loadRealResNetTailWeights(trial.request.WeightsDirectory, trial.executor.params.Slots())
+	if err != nil {
+		return err
+	}
+	bias, err := loadCheckpointRealResNetTailBias(trial.request.CheckpointBiasPath, trial.executor.params.Slots())
+	if err != nil {
+		return err
+	}
+	if err := trial.stageOwner(segment, segment.phase.Name+"/weight", weights.packed); err != nil {
+		return err
+	}
+	if err := trial.stageOwner(segment, segment.phase.Name+"/bias", bias.packed); err != nil {
+		return err
+	}
+	_, _, segment.referenceOutput = fullResNet20PlainTailSchedule(trial.reference, weights, bias)
+	gapMask := make([]complex128, trial.executor.params.Slots())
+	for copyIndex := 0; copyIndex < trial.executor.params.Slots()/realResNetTailReferenceSlots; copyIndex++ {
+		for channel := 0; channel < realResNetTailChannels; channel++ {
+			gapMask[copyIndex*realResNetTailReferenceSlots+channel*realResNetTailSpatialSlots] = complex(1.0/realResNetTailSpatialSlots, 0)
+		}
+	}
+	gapPlaintext := trial.executor.encoder.EncodeNTTAtLvlNew(trial.current.Level(), gapMask, trial.executor.params.LogSlots())
+	input := trial.current
+	phaseName := segment.phase.Name
+	segment.run = func() (*ckks.Ciphertext, error) {
+		evaluator := trial.timedEvaluator()
+		gap := encryptedRealResNetTailRotSum(evaluator, input, realResNetTailSpatialSlots)
+		if gap.Level() != gapPlaintext.Level() {
+			return nil, fmt.Errorf("tail pre-encoded GAP mask level=%d, input=%d", gapPlaintext.Level(), gap.Level())
+		}
+		gap = evaluator.MulNew(gap, gapPlaintext)
+		if err := evaluator.Rescale(gap, trial.executor.params.Scale(), gap); err != nil {
+			return nil, err
+		}
+		repeated := encryptedRealResNetTailRotSum(evaluator, gap, realResNetTailRepeatWidth)
+		repeated = evaluator.RotateNew(repeated, -realResNetTailRepeatWidth+1)
+		weight, err := segment.staged.take(phaseName + "/weight")
+		if err != nil {
+			return nil, err
+		}
+		evaluator.DropLevel(weight, weight.Level()-repeated.Level())
+		classified := evaluator.MulRelinNew(repeated, weight)
+		if err := evaluator.Rescale(classified, trial.executor.params.Scale(), classified); err != nil {
+			return nil, err
+		}
+		classified = encryptedRealResNetTailPaddedRotSum(evaluator, classified)
+		biasCiphertext, err := segment.staged.take(phaseName + "/bias")
+		if err != nil {
+			return nil, err
+		}
+		evaluator.DropLevel(biasCiphertext, biasCiphertext.Level()-classified.Level())
+		evaluator.Add(classified, biasCiphertext, classified)
+		return classified, nil
+	}
+	return nil
+}
+
+func (trial *paperMKFResNet20CPUTrial) Verify() error {
+	if trial.guardedCanonical {
+		return trial.verifyGuardedCanonical()
+	}
+	if trial.verified || trial.active != nil || trial.nextPhase != len(trial.request.Plan.Phases) || trial.current == nil || len(trial.reference) != trial.executor.params.Slots() {
+		return fmt.Errorf("paper-MKF trial is incomplete at untimed verification: nextPhase=%d active=%t", trial.nextPhase, trial.active != nil)
+	}
+	trial.verified = true
+	counts := trial.executor.paperOperationSnapshot()
+	profile := trial.executor.paperAdapter.online.profile
+	if trial.ownerCount != 6201 || counts.mulRelin != 6495 || counts.rotations != 6499 || counts.polynomials != 19 || counts.refreshes != 22 || profile.Decompositions != 45517 || profile.ExternalProductPolys != 91034 {
+		return fmt.Errorf("paper-MKF final structural counts mismatch: owners=%d mul=%d rotations=%d degree59=%d refresh=%d decomp=%d external=%d", trial.ownerCount, counts.mulRelin, counts.rotations, counts.polynomials, counts.refreshes, profile.Decompositions, profile.ExternalProductPolys)
+	}
+	oracle, err := trial.executor.paperOracleCiphertext(trial.current)
+	if err != nil {
+		return err
+	}
+	decoded := trial.executor.encoder.Decode(ckks.NewDecryptor(trial.executor.params, trial.executor.aggregate).DecryptNew(oracle), trial.executor.params.LogSlots())
+	if len(decoded) < len(trial.reference) {
+		return fmt.Errorf("decoded %d slots, want %d", len(decoded), len(trial.reference))
+	}
+	maxError := 0.0
+	for index, want := range trial.reference {
+		delta := cmplx.Abs(decoded[index] - want)
+		if math.IsNaN(delta) || math.IsInf(delta, 0) {
+			return fmt.Errorf("non-finite final error at slot %d", index)
+		}
+		if delta > maxError {
+			maxError = delta
+		}
+	}
+	if maxError >= fullResNet20FunctionalGate {
+		return fmt.Errorf("untimed final oracle max error=%g exceeds %g", maxError, fullResNet20FunctionalGate)
+	}
+	encryptedLogits := make([]float64, realResNetTailClasses)
+	referenceLogits := make([]float64, realResNetTailClasses)
+	for class := 0; class < realResNetTailClasses; class++ {
+		encryptedLogits[class] = real(decoded[class])
+		referenceLogits[class] = real(trial.reference[class])
+	}
+	encryptedTop1, _ := fullResNet20Top1AndMargin(encryptedLogits)
+	referenceTop1, _ := fullResNet20Top1AndMargin(referenceLogits)
+	label := int(trial.request.Fixture.Label)
+	if encryptedTop1 != label || referenceTop1 != label || encryptedTop1 != referenceTop1 {
+		return fmt.Errorf("untimed classification mismatch: encrypted=%d reference=%d label=%d", encryptedTop1, referenceTop1, label)
+	}
+	ownerTotal, refreshRounds, refreshMessages := 0, 0, 0
+	var ownerBytes, refreshBytes uint64
+	for _, stage := range resNet20CPUStages {
+		evidence := trial.communication[stage]
+		wantOwners, wantRefreshes, ok := paperMKFExpectedStageCommunication(stage)
+		if !ok || evidence.OwnerIngressCiphertexts != wantOwners || evidence.RefreshRounds != wantRefreshes || evidence.RefreshShareMessages != wantRefreshes*fullResNet20Parties {
+			return fmt.Errorf("paper-MKF %s communication coverage mismatch: owners=%d/%d refresh=%d/%d messages=%d/%d", stage,
+				evidence.OwnerIngressCiphertexts, wantOwners,
+				evidence.RefreshRounds, wantRefreshes,
+				evidence.RefreshShareMessages, wantRefreshes*fullResNet20Parties)
+		}
+		if evidence.OwnerIngressCiphertexts > 0 && evidence.OwnerIngressBytes == 0 {
+			return fmt.Errorf("paper-MKF %s has owner ciphertexts but no serialized-byte evidence", stage)
+		}
+		if evidence.RefreshShareMessages > 0 && evidence.RefreshShareBytes != uint64(evidence.RefreshShareMessages)*trial.refreshShareSize {
+			return fmt.Errorf("paper-MKF %s refresh-share bytes=%d, want %d", stage, evidence.RefreshShareBytes, uint64(evidence.RefreshShareMessages)*trial.refreshShareSize)
+		}
+		ownerTotal += evidence.OwnerIngressCiphertexts
+		ownerBytes += evidence.OwnerIngressBytes
+		refreshRounds += evidence.RefreshRounds
+		refreshMessages += evidence.RefreshShareMessages
+		refreshBytes += evidence.RefreshShareBytes
+	}
+	if ownerTotal != 6201 || ownerBytes == 0 || refreshRounds != 22 || refreshMessages != 44 || refreshBytes != uint64(44)*trial.refreshShareSize {
+		return fmt.Errorf("paper-MKF communication evidence mismatch: owners=%d bytes=%d refresh=%d messages=%d bytes=%d", ownerTotal, ownerBytes, refreshRounds, refreshMessages, refreshBytes)
+	}
+	if trial.evaluationKeyPayloads <= 0 || trial.evaluationKeyBytes == 0 {
+		return fmt.Errorf("paper-MKF evaluation-key byte evidence is empty")
+	}
+	if trial.recordCommunication == nil {
+		return fmt.Errorf("paper-MKF communication recorder is absent")
+	}
+	trial.recordCommunication(paperMKFCPUTrialCommunication{
+		EvaluationKeyPayloads: trial.evaluationKeyPayloads,
+		EvaluationKeyBytes:    trial.evaluationKeyBytes,
+		Stages:                trial.communication,
+	})
+	return nil
+}
+
+var (
+	_ resNet20CPUBackend                       = (*paperMKFResNet20CPUBackend)(nil)
+	_ resNet20CPUCommunicationArtifactReporter = (*paperMKFResNet20CPUBackend)(nil)
+	_ resNet20CPUSegmentedTrial                = (*paperMKFResNet20CPUTrial)(nil)
+	_ resNet20CPUPreparedSegment               = (*paperMKFResNet20CPUSegment)(nil)
+)
+
+func TestPaperMKFCPUStaticBenchmarkContract(t *testing.T) {
+	if resNet20CPUWarmups != 0 || resNet20CPUTrials != 10 {
+		t.Fatalf("measurement repetition contract changed: warmups=%d trials=%d", resNet20CPUWarmups, resNet20CPUTrials)
+	}
+	backend, err := newAuditedPaperMKFResNet20CPUBackend()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.Implementation() != "MKF-CPU" || backend.ConstructionID() != paperMKFCKKSConstructionID || backend.ParameterID() != "P2" || backend.Parties() != 2 {
+		t.Fatalf("unexpected paper-MKF identity: %s/%s/%s/n=%d", backend.Implementation(), backend.ConstructionID(), backend.ParameterID(), backend.Parties())
+	}
+	wantStages := []resNet20CPUStage{resNet20CPUStem, resNet20CPUResidual, resNet20CPUFullyConn}
+	if len(resNet20CPUStages) != len(wantStages) {
+		t.Fatalf("stage count=%d, want %d", len(resNet20CPUStages), len(wantStages))
+	}
+	for index, want := range wantStages {
+		if resNet20CPUStages[index] != want {
+			t.Fatalf("stage[%d]=%q, want %q", index, resNet20CPUStages[index], want)
+		}
+	}
+	policy := backend.(*paperMKFResNet20CPUBackend).CommunicationBytePolicy()
+	if policy.Schema != "true-mkf-resnet20-cpu-message-byte-policy-v1" || policy.CKSIngressShareMessages != 0 || policy.OwnerIngressEncoding == "" || policy.RefreshShareEncoding == "" || policy.EvaluationKeyEncoding == "" || policy.EvaluationKeyScope == "" || policy.OnlineTimingScope == "" || policy.TransportScope == "" {
+		t.Fatalf("incomplete message-byte policy: %+v", policy)
+	}
+	owners, refreshes := 0, 0
+	for _, stage := range wantStages {
+		stageOwners, stageRefreshes, ok := paperMKFExpectedStageCommunication(stage)
+		if !ok {
+			t.Fatalf("missing communication contract for %s", stage)
+		}
+		owners += stageOwners
+		refreshes += stageRefreshes
+	}
+	if owners != 6201 || refreshes != 22 {
+		t.Fatalf("message coverage owners=%d refreshes=%d, want 6201/22", owners, refreshes)
+	}
+}
+
+func TestPaperMKFCPUSegmentPhaseContract(t *testing.T) {
+	testCases := []struct {
+		stage resNet20CPUStage
+		count int
+		first int
+		last  int
+	}{
+		{resNet20CPUStem, 1, 1, 1},
+		{resNet20CPUResidual, 9, 2, 10},
+		{resNet20CPUFullyConn, 1, 11, 11},
+	}
+	trial := new(paperMKFResNet20CPUTrial)
+	for _, testCase := range testCases {
+		if got := trial.SegmentCount(testCase.stage); got != testCase.count {
+			t.Fatalf("%s segment count=%d, want %d", testCase.stage, got, testCase.count)
+		}
+		first, err := paperMKFSegmentPhaseIndex(testCase.stage, 0)
+		if err != nil || first != testCase.first {
+			t.Fatalf("%s first phase=%d err=%v, want %d", testCase.stage, first, err, testCase.first)
+		}
+		last, err := paperMKFSegmentPhaseIndex(testCase.stage, testCase.count-1)
+		if err != nil || last != testCase.last {
+			t.Fatalf("%s last phase=%d err=%v, want %d", testCase.stage, last, err, testCase.last)
+		}
+	}
+	if _, err := paperMKFSegmentPhaseIndex(resNet20CPUResidual, 9); err == nil {
+		t.Fatal("out-of-range residual segment did not fail closed")
+	}
+}

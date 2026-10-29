@@ -36,10 +36,10 @@ $pythonLeaf = [IO.Path]::GetFileName($PythonExe)
 $useLauncher = $pythonLeaf -in @('py', 'py.exe')
 $scanOut = Join-Path $RunDir 'publication-scan.json'
 if ($useLauncher) {
-    & $PythonExe -3 (Join-Path $PSScriptRoot 'publication_scan.py') --out $scanOut
+    & $PythonExe -3 (Join-Path $PSScriptRoot 'publication_scan.py') --verify-manifest --out $scanOut
 }
 else {
-    & $PythonExe (Join-Path $PSScriptRoot 'publication_scan.py') --out $scanOut
+    & $PythonExe (Join-Path $PSScriptRoot 'publication_scan.py') --verify-manifest --out $scanOut
 }
 if ($LASTEXITCODE -ne 0) {
     throw "Publication scan failed. See $scanOut"

@@ -1,5 +1,10 @@
 # Experiment map
 
+This is the earlier short index. The current complete index is
+[EXPERIMENT_CATALOG.md](EXPERIMENT_CATALOG.md), with commands in
+[RUNBOOK.md](RUNBOOK.md). Read [construction identities](CONSTRUCTION_IDENTITIES.md)
+before interpreting the historical profiler as a paper-construction result.
+
 All commands below are run from the repository root. Heavy and opt-in tests
 are not launched by the default smoke profile.
 

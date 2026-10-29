@@ -3,6 +3,10 @@
 This artifact deliberately separates source availability from measured
 hardware evidence.
 
+Source construction identities are also distinct: see
+[CONSTRUCTION_IDENTITIES.md](CONSTRUCTION_IDENTITIES.md). No historical
+profiler output is promoted to a matched paper-construction measurement.
+
 | Claim | Metric | Baseline | Controlled variables | Measurement boundary | Current status |
 |---|---|---|---|---|---|
 | MKF software correctness | Decrypt-and-compare result | Scheme reference | P1, ring degree, parties, inputs | Go unit test | Runnable |

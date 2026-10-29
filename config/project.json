@@ -1,0 +1,8 @@
+{
+  "name": "MKF",
+  "release_stage": "initial_source_scaffold",
+  "hardware_target": "AMD Alveo U55C",
+  "source_manifest": "PUBLICATION_MANIFEST.sha256",
+  "git_content_policy": "Preserve the exact bytes of manifest-bound source files; no automatic line-ending conversion.",
+  "scope_note": "Existing source and documented pending components; not a complete board-ready CNN accelerator."
+}

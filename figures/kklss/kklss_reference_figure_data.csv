@@ -1,0 +1,49 @@
+construction,scheme,parameter,parties,platform,latency_ms,evidence_status
+KKLSS,CKKS,P1,2,CPU,155.000000,transcribed from author-provided reference figure
+KKLSS,CKKS,P1,4,CPU,266.000000,transcribed from author-provided reference figure
+KKLSS,CKKS,P1,8,CPU,495.000000,transcribed from author-provided reference figure
+KKLSS,CKKS,P1,16,CPU,994.000000,transcribed from author-provided reference figure
+KKLSS,CKKS,P1,32,CPU,1897.000000,transcribed from author-provided reference figure
+KKLSS,CKKS,P1,64,CPU,3732.000000,transcribed from author-provided reference figure
+KKLSS,CKKS,P1,2,FPGA,0.290000,transcribed from author-provided reference figure
+KKLSS,CKKS,P1,4,FPGA,0.477000,transcribed from author-provided reference figure
+KKLSS,CKKS,P1,8,FPGA,0.851000,transcribed from author-provided reference figure
+KKLSS,CKKS,P1,16,FPGA,1.740000,transcribed from author-provided reference figure
+KKLSS,CKKS,P1,32,FPGA,3.380000,transcribed from author-provided reference figure
+KKLSS,CKKS,P1,64,FPGA,6.590000,transcribed from author-provided reference figure
+KKLSS,CKKS,P2,2,CPU,1145.000000,transcribed from author-provided reference figure
+KKLSS,CKKS,P2,4,CPU,2205.000000,transcribed from author-provided reference figure
+KKLSS,CKKS,P2,8,CPU,4186.000000,transcribed from author-provided reference figure
+KKLSS,CKKS,P2,16,CPU,8480.000000,transcribed from author-provided reference figure
+KKLSS,CKKS,P2,32,CPU,16710.000000,transcribed from author-provided reference figure
+KKLSS,CKKS,P2,64,CPU,33474.000000,transcribed from author-provided reference figure
+KKLSS,CKKS,P2,2,FPGA,2.850000,transcribed from author-provided reference figure
+KKLSS,CKKS,P2,4,FPGA,4.350000,transcribed from author-provided reference figure
+KKLSS,CKKS,P2,8,FPGA,7.080000,transcribed from author-provided reference figure
+KKLSS,CKKS,P2,16,FPGA,14.500000,transcribed from author-provided reference figure
+KKLSS,CKKS,P2,32,FPGA,30.820000,transcribed from author-provided reference figure
+KKLSS,CKKS,P2,64,FPGA,58.570000,transcribed from author-provided reference figure
+KKLSS,BFV,P1,2,CPU,267.000000,transcribed from author-provided reference figure
+KKLSS,BFV,P1,4,CPU,477.000000,transcribed from author-provided reference figure
+KKLSS,BFV,P1,8,CPU,892.000000,transcribed from author-provided reference figure
+KKLSS,BFV,P1,16,CPU,1721.000000,transcribed from author-provided reference figure
+KKLSS,BFV,P1,32,CPU,3353.000000,transcribed from author-provided reference figure
+KKLSS,BFV,P1,64,CPU,6571.000000,transcribed from author-provided reference figure
+KKLSS,BFV,P1,2,FPGA,0.530000,author-supplied replacement values; not a new measurement
+KKLSS,BFV,P1,4,FPGA,0.814000,author-supplied replacement values; not a new measurement
+KKLSS,BFV,P1,8,FPGA,1.493000,author-supplied replacement values; not a new measurement
+KKLSS,BFV,P1,16,FPGA,2.380000,author-supplied replacement values; not a new measurement
+KKLSS,BFV,P1,32,FPGA,5.129000,author-supplied replacement values; not a new measurement
+KKLSS,BFV,P1,64,FPGA,10.482000,author-supplied replacement values; not a new measurement
+KKLSS,BFV,P2,2,CPU,1927.000000,transcribed from author-provided reference figure
+KKLSS,BFV,P2,4,CPU,3716.000000,transcribed from author-provided reference figure
+KKLSS,BFV,P2,8,CPU,6229.000000,transcribed from author-provided reference figure
+KKLSS,BFV,P2,16,CPU,11747.000000,transcribed from author-provided reference figure
+KKLSS,BFV,P2,32,CPU,23136.000000,transcribed from author-provided reference figure
+KKLSS,BFV,P2,64,CPU,54115.000000,transcribed from author-provided reference figure
+KKLSS,BFV,P2,2,FPGA,3.690000,transcribed from author-provided reference figure
+KKLSS,BFV,P2,4,FPGA,5.860000,transcribed from author-provided reference figure
+KKLSS,BFV,P2,8,FPGA,10.790000,transcribed from author-provided reference figure
+KKLSS,BFV,P2,16,FPGA,21.370000,transcribed from author-provided reference figure
+KKLSS,BFV,P2,32,FPGA,40.070000,transcribed from author-provided reference figure
+KKLSS,BFV,P2,64,FPGA,80.550000,transcribed from author-provided reference figure

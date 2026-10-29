@@ -57,6 +57,14 @@ def source_files(root: Path) -> list[Path]:
         parts = {part.lower() for part in relative.parts}
         if parts.intersection({".git", ".local", ".pytest_cache", ".venv", "__pycache__"}):
             continue
+        rel = relative.as_posix()
+        if rel.startswith(('fixtures/generated/', 'datasets/local/')):
+            continue
+        if rel in {'software/kklss/cnn/data/mnist_test.csv',
+                   'software/kklss/cnn/data/mnist_test.csv.metadata.json'}:
+            continue
+        if rel.startswith('figures/') and path.suffix.lower() in {'.pdf', '.png', '.svg'}:
+            continue
         if path.is_file():
             files.append(path)
     return sorted(files, key=lambda item: item.as_posix())
@@ -151,15 +159,43 @@ def write_manifest(root: Path, files: list[Path]) -> None:
     manifest.write_text("\n".join(records) + "\n", encoding="utf-8", newline="\n")
 
 
+def verify_manifest(root: Path, files: list[Path]) -> list[dict[str, str]]:
+    manifest = root / 'PUBLICATION_MANIFEST.sha256'
+    if not manifest.is_file():
+        return [{'name': 'manifest', 'detail': 'missing; create only after review with --write-manifest'}]
+    failures = []
+    expected = {path.relative_to(root).as_posix(): path for path in files if path != manifest}
+    seen = set()
+    for line in manifest.read_text(encoding='utf-8').splitlines():
+        match = re.fullmatch(r'([0-9a-f]{64})  (.+)', line)
+        if match is None:
+            failures.append({'name': 'manifest-format', 'detail': 'invalid record'})
+            continue
+        digest, relative = match.groups()
+        if relative in seen or relative not in expected:
+            failures.append({'name': 'manifest-path', 'detail': relative})
+            continue
+        seen.add(relative)
+        if sha256(expected[relative]) != digest:
+            failures.append({'name': 'manifest-hash', 'detail': relative})
+    for relative in sorted(expected.keys() - seen):
+        failures.append({'name': 'manifest-unlisted', 'detail': relative})
+    return failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path)
     parser.add_argument("--out", type=Path)
-    parser.add_argument("--write-manifest", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--write-manifest", action="store_true")
+    mode.add_argument("--verify-manifest", action="store_true")
     args = parser.parse_args()
 
     root = (args.root or Path(__file__).resolve().parent.parent).resolve()
     checks, failures, files = scan(root)
+    if args.verify_manifest:
+        failures.extend(verify_manifest(root, files))
     report = {
         "schema": "mkf-u55c-publication-scan-v1",
         "status": "PASS" if not failures else "FAIL",

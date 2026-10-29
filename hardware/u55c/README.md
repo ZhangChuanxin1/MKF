@@ -21,3 +21,7 @@ cannot be overridden from the command line.
 This is not a board-complete design. The current top-level interfaces still
 need U55C XRT integration, connectivity/HBM mapping, a `phase_events`
 consumer, link and route, timing closure and board correctness validation.
+
+Separate arithmetic microkernel and RTL sources are indexed in
+[micro/README.md](micro/README.md). They are source/OOC research paths, not
+additional completed U55C measurements.
